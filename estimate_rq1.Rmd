@@ -1,0 +1,1002 @@
+---
+title: "研究課題1の推定：被害と地震保険加入（イベントスタディ型DID・PSM）"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+documentclass: bxjsarticle
+classoption:
+  - xelatex
+  - ja=standard
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+params:
+  in_dir: "/home/rstudio/works/output/analysis"    # analysis_data.Rmd の出力先
+  panel_file: "/home/rstudio/works/output/khps_panel_2007_2018.rds"  # (9) の時変の変数を取るための前処理済みパネル
+  out_dir: "/home/rstudio/works/output/estimates"  # 係数表（CSV）の保存先
+  share_mode: false
+  min_cell: 10
+  show_code: false
+---
+
+<!--
+==============================================================================
+実行コマンド（RStudio のコンソールにそのまま貼る）
+初回だけ、パッケージを入れる：
+install.packages(c("fixest", "MatchIt"))
+
+Sys.setlocale("LC_CTYPE", "C.UTF-8")
+setwd("/home/rstudio/khps_preprocess")
+
+# 1) 自分用
+rmarkdown::render("estimate_rq1.Rmd",
+                  output_dir = "/home/rstudio/works/output/reports",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = FALSE))
+
+# 2) 共有用（目で確認してから Claude outputs にコピーする）
+rmarkdown::render("estimate_rq1.Rmd",
+                  output_file = "estimate_rq1_share.pdf",
+                  output_dir = "/home/rstudio/works/share_check",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = TRUE, min_cell = 10))
+
+前提：先に analysis_data.Rmd を実行して es_panel.rds などを作っておく。
+==============================================================================
+-->
+
+```{r setup, include=FALSE}
+source("share_utils.R")
+SHARE    <- isTRUE(params$share_mode)
+MIN_CELL <- params$min_cell
+
+knitr::opts_chunk$set(echo = params$show_code, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 3.5)
+for (p in c("fixest", "MatchIt")) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop("パッケージ ", p, " がありません。コンソールで install.packages(\"", p, "\") を実行してください。")
+  }
+}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+library(ggplot2)
+library(fixest)
+library(MatchIt)
+
+sh_check_dir(params$out_dir)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r banner, results='asis'}
+sh_banner()
+```
+
+# この文書について
+
+研究課題1（被災経験と、その後の地震保険加入の関連）を推定します。**推定の指定は結果を見る前に決めたもので、主分析・頑健性の結果はすべて報告します。**
+
+| 区分 | 内容 |
+|---|---|
+| 推定対象 | 被害あり世帯の地震保険加入率の、被害なし世帯と比べた震災後の追加的な変化 |
+| 処置群／対照群 | GEES第1回で住居または家財に被害あり／なし（2011年に持家、GEES第1回回答） |
+| 処置時点 | 2011年3月（2011年調査＝k=−1 が最後の震災前、2012年調査＝k=0） |
+| 目的変数 | `y_eq`：地震保険加入（2011年以前は持家の世帯への「世帯で地震保険に加入しているか」、住居・家財の区別なし。2012年以降は住居または家財） |
+| 固定効果 | 世帯FE＋調査年FE（時変の統制変数なし） |
+| 標準誤差 | 世帯でクラスタリング |
+| 期間 | 主分析 2007〜2016年調査（k=−5〜+4） |
+
+**解釈**：被害のない世帯も震災の影響を受けているため、係数は「全国的な加入の増加に上乗せされる、被害世帯の追加的な差」です。識別の前提は、被害がなかったとしたら両群の加入率は同じように推移した（平行トレンド）ことで、震災前の係数（k=−5〜−2）で部分的に確かめます。
+
+**事前に決めた指定**
+
+- 主分析：全標本の固定効果イベントスタディ（上の表）。要約として、震災後をまとめた DID 係数（`treat × post`）も示す。
+- 頑健性（すべて報告）：(1) 地域ブロック×年FE、(2) 2011年所得三分位×年FE、(3) 震災前（2007〜2011年）の平均を基準にした推定、(4) 目的変数を「住居」に限定、(5) 2007〜2018年への延長、(6) (5) から九州を除外、(7) PSMで作ったマッチング標本での再推定。
+- **10月30日に追加した頑健性**（結果を見た後に追加したことを明記して、結果にかかわらず報告する）：(8) 震災前（2011年）の属性×年＋地域×年FE（条件付きの平行トレンド）、(9) その年の log年収・log金融資産・同居人数を時変の統制変数として入れる（震災後の値を含むため参考。被害で年収の変化に差がなかったことを根拠とする）、(10) その年に持家と答えた観測だけを使う、(11) 主分析期間中ずっと持家の世帯だけを使う。(10)(11)は、2012年以降の質問が全世帯に聞かれる（2011年以前は持家のみ）ことに対応するもの。持家でなくなることは被害の影響を受けうるので、被害の有無別に持家でなくなった割合も示す。
+- **11月5日に追加した確認**（ゼミの指摘への対応。結果を見た後に追加したもので、新しい頑健性の指定ではなく、係数の違いの理由を調べるための記述と分解）：(A) 地域別の加入率の推移（被害なし世帯を関東・関東以外に分け、地域構成を被害あり世帯に合わせた重み付きの推移も示す）と、関東の世帯だけ・重み付きの DID 係数。(B) (9) の係数が小さくなった理由の分解（(9) と同じ標本で主分析を推定し直し、統制変数を1つずつ加える）と、統制変数の欠測の内訳。
+- PSM：2011年調査の共変量によるロジットの傾向スコアで、地域（東北・関東・その他）が同じ世帯の中から、1世帯に2世帯を非復元で最近傍マッチング（キャリパーは傾向スコアの線形予測値の標準偏差の0.2倍）。地域をそろえるのは、被害あり世帯が東北・関東に集中しているため（バランス表で確認）。
+- PSMの妥当性の確認：(a) 2011年→2013年調査の年収の変化に被害による差がないか（2012年調査の年収は震災前後が混在するので参考）、(b) 2007年調査の共変量で同じPSMを行い、震災前の窓（2007→2011年）の加入の変化に差がないか（プラセボ）。
+
+```{r load}
+es    <- readRDS(file.path(params$in_dir, "es_panel.rds"))
+psm11 <- readRDS(file.path(params$in_dir, "psm_base2011.rds"))
+psm07 <- readRDS(file.path(params$in_dir, "psm_placebo2007.rds"))
+
+es_main <- es %>% filter(in_main == 1)
+
+# 係数表を作る共通関数（95%信頼区間つき）
+tidy_fe <- function(m, keep = NULL, label = NULL) {
+  ct <- as.data.frame(coeftable(m))
+  ci <- as.data.frame(confint(m, level = 0.95))
+  out <- tibble(term = rownames(ct), est = ct[, 1], se = ct[, 2], p = ct[, 4],
+                lo = ci[, 1], hi = ci[, 2])
+  if (!is.null(keep)) out <- out %>% filter(grepl(keep, term))
+  if (!is.null(label)) out <- out %>% mutate(model = label, .before = 1)
+  out
+}
+fmt_ci <- function(lo, hi) sprintf("[%.3f, %.3f]", lo, hi)
+fmt_p  <- function(p) format.pval(p, digits = 3, eps = 0.001)
+# 世帯数は固定効果の水準の数（fixef() の値の種類の数ではない）
+n_info <- function(m) c(obs = nobs(m), hh = unname(m$fixef_sizes["hh_id"]))
+```
+
+# 主分析：イベントスタディ
+
+$$
+y_{it} = \sum_{k \neq -1} \beta_k \cdot \text{treat}_i \cdot 1(t - 2012 = k) + \alpha_i + \lambda_t + \varepsilon_{it}
+$$
+
+```{r es-main}
+m_es <- feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year,
+              data = es_main, cluster = ~hh_id)
+m_did <- feols(y_eq ~ treat_post | hh_id + survey_year,
+               data = es_main, cluster = ~hh_id)
+
+es_tab <- tidy_fe(m_es) %>%
+  mutate(k = as.integer(sub("^k::(-?[0-9]+):treat$", "\\1", term))) %>%
+  bind_rows(tibble(k = -1L, est = 0, se = NA, p = NA, lo = 0, hi = 0)) %>%
+  arrange(k)
+
+# 震災前の係数（k=-5〜-2）がすべて0か（平行トレンドの部分的な確認）
+pre_test <- tryCatch(wald(m_es, keep = "^k::-[2-5]:treat$", print = FALSE),
+                     error = function(e) NULL)
+
+es_tab %>%
+  transmute(相対年k = k, 調査年 = k + 2012,
+            係数 = sprintf("%.3f", est),
+            標準誤差 = if_else(is.na(se), "（基準）", sprintf("%.3f", se)),
+            `95%信頼区間` = if_else(is.na(se), "", fmt_ci(lo, hi)),
+            p値 = if_else(is.na(p), "", fmt_p(p))) %>%
+  sh_kable(caption = sprintf("イベントスタディの係数（主分析、観測数 %s、世帯数 %s）",
+                             format(nobs(m_es), big.mark = ","),
+                             format(n_info(m_es)["hh"], big.mark = ",")))
+```
+
+```{r es-main-test, results='asis'}
+if (!is.null(pre_test)) {
+  cat(sprintf("**震災前の係数（k=−5〜−2）がすべて0という仮説の検定**：F = %.2f、p = %s。\n\n",
+              pre_test$stat, fmt_p(pre_test$p)))
+}
+d <- tidy_fe(m_did, keep = "treat_post")
+cat(sprintf("**震災後をまとめた DID 係数**（treat × post、基準は震災前の全期間）：%.3f（95%%信頼区間 %s、p = %s）。\n\n",
+            d$est, fmt_ci(d$lo, d$hi), fmt_p(d$p)))
+cat("信頼区間に0が含まれる場合は「この標本では差を検出できなかった」と書き、区間の上限・下限を「否定できる効果の大きさ」として示す。\n")
+```
+
+```{r es-main-fig, fig.height=3.4}
+ggplot(es_tab, aes(k, est)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.15) +
+  geom_point() +
+  scale_x_continuous(breaks = -5:4) +
+  labs(x = "Years relative to the earthquake (k = survey year - 2012)",
+       y = "Coefficient (damaged - not damaged)") +
+  theme_minimal()
+```
+
+図は係数と95%信頼区間です。k=−1（2011年調査）を0に固定しています。群別の生の加入率の推移は analysis_data のPDF（表と図）を並べて示してください。
+
+# 頑健性
+
+```{r robust}
+es_rob  <- es                                   # 2007〜2018年
+es_robk <- es %>% filter(kyushu == 0)           # 2007〜2018年、九州除外
+es_main <- es_main %>% mutate(k_post = if_else(k >= 0, k, -1))  # 震災前を一つの基準にまとめる
+
+# ---- (8) 震災前（2011年調査）の属性 × 年 ----
+# 2011年の値は世帯ごとに一定なので、そのままでは世帯FEに吸収される。年ダミーとの交差項
+# （2011年を基準）として入れ、「属性が同じ世帯の間での平行トレンド」を仮定する。
+cov8 <- c("log_inc_imp", "log_inc_miss", "log_fin_imp", "log_fin_miss",
+          "age_imp", "condo_imp", "mortgage_imp", "big_city_imp")
+es_main <- es_main %>%
+  left_join(psm11 %>% select(hh_id, all_of(cov8)), by = "hh_id")
+x8 <- paste0("i(survey_year, ", cov8, ", ref = 2011)", collapse = " + ")
+f8_es  <- as.formula(paste("y_eq ~ i(k, treat, ref = -1) +", x8, "| hh_id + region_year"))
+f8_did <- as.formula(paste("y_eq ~ treat_post +",            x8, "| hh_id + region_year"))
+
+# ---- (9) その年の値（時変の統制変数） ----
+# 震災後の値を含むため bad control になりうる。年収の変化に被害による差がないかを
+# 下の「PSMの妥当性の確認」(a) で確かめ、参考として示す。欠測のある年は推定から落ちる。
+tv <- readRDS(params$panel_file) %>%
+  filter(hh_id %in% es_main$hh_id) %>%
+  distinct(hh_id, survey_year, .keep_all = TRUE) %>%
+  transmute(hh_id, survey_year,
+            log_inc_t = log1p(hh_inc_gross),
+            log_fin_t = log1p(pmax(fin_assets, 0)),
+            hh_size_t = hh_size)
+es_main <- es_main %>% left_join(tv, by = c("hh_id", "survey_year"))
+
+# ---- (10)(11) 持家に限る ----
+# 2011年以前の地震保険の質問は持家の世帯だけに聞いているが、2012年以降は全世帯に聞いている。
+es_own_t  <- es_main %>% filter(owner %in% 1)        # (10) その年に持家と答えた観測
+es_own_hh <- es_main %>% filter(always_owner)        # (11) 期間中ずっと持家の世帯
+
+specs <- list(
+  "主分析"                    = feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(1) 地域×年FE"             = feols(y_eq ~ i(k, treat, ref = -1) | hh_id + region_year, es_main, cluster = ~hh_id),
+  "(2) 所得三分位×年FE"       = feols(y_eq ~ i(k, treat, ref = -1) | hh_id + inc3_year,   es_main, cluster = ~hh_id),
+  "(3) 震災前平均が基準"      = feols(y_eq ~ i(k_post, treat, ref = -1) | hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(4) 目的変数＝住居"        = feols(y_eq_house ~ i(k, treat, ref = -1) | hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(5) 2007〜2018年"          = feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year, es_rob,  cluster = ~hh_id),
+  "(6) 2007〜2018年・九州除外" = feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year, es_robk, cluster = ~hh_id),
+  "(8) 震災前の属性×年＋地域×年" = feols(f8_es, es_main, cluster = ~hh_id),
+  "(9) 時変の統制変数（参考）" = feols(y_eq ~ i(k, treat, ref = -1) + log_inc_t + log_fin_t + hh_size_t |
+                                       hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(10) その年に持家の観測" = feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year, es_own_t,  cluster = ~hh_id),
+  "(11) ずっと持家の世帯"   = feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year, es_own_hh, cluster = ~hh_id)
+)
+
+# DID（treat × post）版も同じ指定で
+did_specs <- list(
+  "主分析"                    = feols(y_eq ~ treat_post | hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(1) 地域×年FE"             = feols(y_eq ~ treat_post | hh_id + region_year, es_main, cluster = ~hh_id),
+  "(2) 所得三分位×年FE"       = feols(y_eq ~ treat_post | hh_id + inc3_year,   es_main, cluster = ~hh_id),
+  "(3) 震災前平均が基準"      = feols(y_eq ~ treat_post | hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(4) 目的変数＝住居"        = feols(y_eq_house ~ treat_post | hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(5) 2007〜2018年"          = feols(y_eq ~ treat_post | hh_id + survey_year, es_rob,  cluster = ~hh_id),
+  "(6) 2007〜2018年・九州除外" = feols(y_eq ~ treat_post | hh_id + survey_year, es_robk, cluster = ~hh_id),
+  "(8) 震災前の属性×年＋地域×年" = feols(f8_did, es_main, cluster = ~hh_id),
+  "(9) 時変の統制変数（参考）" = feols(y_eq ~ treat_post + log_inc_t + log_fin_t + hh_size_t |
+                                       hh_id + survey_year, es_main, cluster = ~hh_id),
+  "(10) その年に持家の観測" = feols(y_eq ~ treat_post | hh_id + survey_year, es_own_t,  cluster = ~hh_id),
+  "(11) ずっと持家の世帯"   = feols(y_eq ~ treat_post | hh_id + survey_year, es_own_hh, cluster = ~hh_id)
+)
+```
+
+```{r robust-table}
+rob_es <- imap_dfr(specs, ~ tidy_fe(.x, label = .y)) %>%
+  mutate(k = as.integer(sub("^k(_post)?::(-?[0-9]+):treat$", "\\2", term))) %>%
+  filter(!is.na(k))
+
+rob_es %>%
+  filter(k %in% c(-3, -2, 0, 2, 4)) %>%
+  mutate(値 = sprintf("%.3f %s", est, fmt_ci(lo, hi))) %>%
+  select(model, k, 値) %>%
+  pivot_wider(names_from = k, values_from = 値, names_prefix = "k=") %>%
+  rename(推定 = model) %>%
+  sh_kable(caption = "頑健性：主な相対年の係数と95%信頼区間（全係数は CSV に保存）")
+
+imap_dfr(did_specs, ~ tidy_fe(.x, keep = "treat_post", label = .y) %>%
+           mutate(観測数 = nobs(.x))) %>%
+  transmute(推定 = model, 係数 = sprintf("%.3f", est), `95%信頼区間` = fmt_ci(lo, hi),
+            p値 = fmt_p(p), 観測数 = format(観測数, big.mark = ",")) %>%
+  sh_kable(caption = "頑健性：震災後をまとめた DID 係数（treat × post）")
+```
+
+(3) の DID 係数は主分析の DID と同じ式になります（もともと基準が震災前の全期間のため）。(3) の違いはイベントスタディの側に出ます。
+
+**震災後に持家でなくなった世帯**（(10)(11)の読み方の確認）：2012〜2016年調査のどこかで「持家でない」と答えた世帯の割合です。被害あり世帯で高ければ、被害で持家を手放した世帯が(10)(11)から抜けているので、結果は慎重に読む必要があります。
+
+```{r own-loss}
+own_loss <- es_main %>%
+  filter(k >= 0, !is.na(owner)) %>%
+  group_by(hh_id, treat) %>%
+  summarise(lost = as.numeric(any(owner == 0)), .groups = "drop")
+ol <- own_loss %>%
+  group_by(群 = if_else(treat == 1, "被害あり", "被害なし")) %>%
+  summarise(n = n(), k1 = sum(lost), p = mean(lost), .groups = "drop")
+ol %>%
+  mutate(`持家でなくなった割合` = {
+           x <- sh_stat(p, n)
+           if (SHARE) x[k1 < MIN_CELL | (n - k1) < MIN_CELL] <- "—"
+           x },
+         `震災後に所有の回答がある世帯` = sh_n(n)) %>%
+  select(群, `震災後に所有の回答がある世帯`, `持家でなくなった割合`) %>%
+  sh_kable(caption = "震災後（2012〜2016年調査）に一度でも持家でないと答えた世帯の割合")
+m_ol <- lm(lost ~ treat, data = own_loss)
+ci_ol <- confint(m_ol)["treat", ]
+```
+
+```{r own-loss-txt, results='asis'}
+ol_hidden <- SHARE && any(ol$k1 < MIN_CELL | (ol$n - ol$k1) < MIN_CELL)
+if (ol_hidden) {
+  cat("（共有用では、件数の小さいセルが差から逆算できるため、差も伏せています。）\n")
+} else cat(sprintf("被害あり − 被害なしの差：%.3f（95%%信頼区間 %s、p = %s）。\n",
+            coef(m_ol)["treat"], fmt_ci(ci_ol[1], ci_ol[2]),
+            fmt_p(summary(m_ol)$coefficients["treat", 4])))
+```
+
+# 11月5日に追加した確認（ゼミの指摘への対応）
+
+この節は結果を見た後に追加したものです。新しい頑健性の指定ではなく、(A) 被害あり・なしの推移の違いが地域の偏りによるものか、(B) (9) で係数が変わるのは統制変数のせいか標本が変わったせいか、を調べるための記述と分解です。
+
+## (A) 地域別の加入率の推移
+
+被害あり・なしの地域構成の違いを考慮するため、被害なし世帯を地域で分け、被害あり世帯と同じ地域の被害なし世帯の推移が、被害あり世帯とどれだけ重なるかを見ます。地域は2011年調査の地域ブロックです。被害あり世帯は「関東」と「関東以外」（東北・その他）の2つに分けます（東北だけでは世帯数が少ないため）。
+
+**重み付きの推移**：被害なし世帯に「地域ごとの被害あり世帯の割合 ÷ 被害なし世帯の割合」（東北・関東・その他の3区分）の重みを付け、被害なし世帯の地域構成を被害あり世帯と同じにした推移です。地域×年FE（頑健性(1)）を図にしたものに近い比較です。
+
+```{r region-prep}
+hh_reg <- es_main %>%
+  distinct(hh_id, .keep_all = TRUE) %>%
+  transmute(hh_id, treat,
+            reg3 = case_when(base_region == 2 ~ "東北", base_region == 3 ~ "関東",
+                             !is.na(base_region) ~ "その他"))
+reg_share <- hh_reg %>% filter(!is.na(reg3)) %>%
+  count(treat, reg3) %>% group_by(treat) %>% mutate(s = n / sum(n)) %>% ungroup() %>%
+  select(-n) %>% pivot_wider(names_from = treat, values_from = s, names_prefix = "s")
+hh_reg <- hh_reg %>% left_join(reg_share, by = "reg3") %>%
+  mutate(w_reg = case_when(treat == 1 ~ 1, !is.na(reg3) ~ s1 / s0, TRUE ~ NA_real_)) %>%
+  select(hh_id, reg3, w_reg)
+es_reg <- es_main %>% left_join(hh_reg, by = "hh_id")
+
+# 地域構成（世帯数）
+comp <- es_reg %>% distinct(hh_id, .keep_all = TRUE) %>%
+  count(群 = if_else(treat == 1, "被害あり", "被害なし"), 地域 = coalesce(reg3, "不明")) %>%
+  pivot_wider(names_from = 地域, values_from = n, values_fill = 0)
+sh_kable(sh_mask_counts(as.data.frame(comp), setdiff(names(comp), "群")),
+         caption = "被害あり・なしの地域構成（世帯数、2011年の地域ブロック）")
+```
+
+```{r region-trend}
+grp_def <- list(
+  "被害あり（全体）"         = quote(treat == 1),
+  "被害あり・関東"           = quote(treat == 1 & reg3 == "関東"),
+  "被害あり・関東以外"       = quote(treat == 1 & reg3 %in% c("東北", "その他")),
+  "被害なし（全体）"         = quote(treat == 0),
+  "被害なし・関東"           = quote(treat == 0 & reg3 == "関東"),
+  "被害なし・東北"           = quote(treat == 0 & reg3 == "東北"),
+  "被害なし・関東以外"       = quote(treat == 0 & reg3 %in% c("東北", "その他"))
+)
+d_tr <- es_reg %>% filter(!is.na(y_eq))
+tr <- imap_dfr(grp_def, function(cond, nm) {
+  d_tr %>% filter(!!cond) %>% group_by(survey_year) %>%
+    summarise(群 = nm, n = n(), k1 = sum(y_eq), rate = mean(y_eq), .groups = "drop")
+}) %>%
+  bind_rows(d_tr %>% filter(treat == 0, !is.na(w_reg)) %>% group_by(survey_year) %>%
+              summarise(群 = "被害なし（重み付き）", n = n(), k1 = sum(y_eq),
+                        rate = weighted.mean(y_eq, w_reg), .groups = "drop")) %>%
+  mutate(群 = factor(群, levels = c(names(grp_def), "被害なし（重み付き）")),
+         # 共有用：該当・非該当のどちらかが min_cell 未満の割合は伏せる
+         hide = SHARE & (n < MIN_CELL | (k1 > 0 & k1 < MIN_CELL) | (n - k1 > 0 & n - k1 < MIN_CELL)))
+
+tr %>% mutate(v = if_else(hide, "—", sprintf("%.3f", rate))) %>%
+  select(群, survey_year, v) %>%
+  pivot_wider(names_from = survey_year, values_from = v) %>%
+  sh_kable(caption = "地域別の地震保険加入率（生の平均。重み付きは被害なし世帯の地域構成を被害あり世帯に合わせたもの）")
+
+n_wide <- tr %>% select(群, survey_year, n) %>%
+  pivot_wider(names_from = survey_year, values_from = n)
+sh_kable(sh_mask_counts(as.data.frame(n_wide), setdiff(names(n_wide), "群"), secondary = FALSE),
+         caption = "上の表の観測世帯数")
+```
+
+```{r region-trend-fig, fig.height=3.8}
+fig_lab <- c("被害あり（全体）" = "Damaged (all)", "被害あり・関東" = "Damaged: Kanto",
+             "被害なし・関東" = "Not damaged: Kanto", "被害なし・関東以外" = "Not damaged: outside Kanto",
+             "被害なし（重み付き）" = "Not damaged: reweighted")
+tr %>% filter(as.character(群) %in% names(fig_lab), !hide) %>%
+  mutate(group = factor(unname(fig_lab[as.character(群)]), levels = unname(fig_lab))) %>%
+  ggplot(aes(survey_year, rate, linetype = group, shape = group)) +
+  geom_vline(xintercept = 2011.5, linewidth = 0.3) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = 2007:2016) +
+  labs(x = "Survey year (January)", y = "Earthquake insurance take-up", linetype = NULL, shape = NULL) +
+  theme_minimal() + theme(legend.position = "bottom") +
+  guides(linetype = guide_legend(nrow = 2))
+```
+
+```{r region-change}
+chg <- tr %>% filter(survey_year %in% c(2011, 2016)) %>%
+  select(群, survey_year, rate, hide) %>%
+  pivot_wider(names_from = survey_year, values_from = c(rate, hide)) %>%
+  mutate(h = hide_2011 | hide_2016,
+         `2011年` = if_else(h, "—", sprintf("%.3f", rate_2011)),
+         `2016年` = if_else(h, "—", sprintf("%.3f", rate_2016)),
+         `変化（ポイント）` = if_else(h, "—", sprintf("%+.1f", 100 * (rate_2016 - rate_2011)))) %>%
+  select(群, `2011年`, `2016年`, `変化（ポイント）`)
+sh_kable(chg, caption = "2011→2016年の加入率の変化（生の平均。脱落による標本の入れ替わりは考慮していない）")
+```
+
+**地域をそろえた DID 係数**：主分析・地域×年FE（頑健性(1)）に加えて、関東の世帯だけの推定と、上の重みを付けた推定を並べます。4つが近ければ、主分析との差は「比較相手の地域構成の違い」で説明できます。
+
+```{r region-did}
+reg_did <- list(
+  "主分析（全標本）"           = feols(y_eq ~ treat_post | hh_id + survey_year, es_reg, cluster = ~hh_id),
+  "(1) 地域×年FE"              = feols(y_eq ~ treat_post | hh_id + region_year, es_reg, cluster = ~hh_id),
+  "関東の世帯だけ"             = feols(y_eq ~ treat_post | hh_id + survey_year,
+                                       filter(es_reg, reg3 == "関東"), cluster = ~hh_id),
+  "被害なしを地域構成で重み付け" = feols(y_eq ~ treat_post | hh_id + survey_year,
+                                       filter(es_reg, !is.na(w_reg)), weights = ~w_reg, cluster = ~hh_id)
+)
+reg_es_kanto <- feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year,
+                      filter(es_reg, reg3 == "関東"), cluster = ~hh_id)
+
+imap_dfr(reg_did, ~ tidy_fe(.x, keep = "treat_post", label = .y) %>%
+           mutate(obs = nobs(.x), hh = n_info(.x)["hh"])) %>%
+  transmute(推定 = model, 係数 = sprintf("%.3f", est), `95%信頼区間` = fmt_ci(lo, hi),
+            p値 = fmt_p(p), 観測数 = format(obs, big.mark = ","), 世帯数 = format(hh, big.mark = ",")) %>%
+  sh_kable(caption = "地域をそろえた DID 係数（treat × post）")
+
+tidy_fe(reg_es_kanto) %>%
+  mutate(k = as.integer(sub("^k::(-?[0-9]+):treat$", "\\1", term))) %>%
+  filter(!is.na(k)) %>% arrange(k) %>%
+  transmute(相対年k = k, 係数 = sprintf("%.3f", est), `95%信頼区間` = fmt_ci(lo, hi), p値 = fmt_p(p)) %>%
+  sh_kable(caption = "関東の世帯だけのイベントスタディ係数（k=−1 が基準）")
+```
+
+**読み方**：
+
+- 関東の被害なし世帯の推移が、被害あり世帯（とくに関東）の震災前の推移と重なり、全国の被害なし世帯より震災後の伸びが小さければ、地域×年FEでの係数の違いは、関東の被害なし世帯の伸びの違いで説明できます。
+- 関東の中だけでも震災後に差が開いていれば、被害の有無による差は地域の違いだけでは説明できません。
+- 関東の被害なし世帯の伸びが小さい場合、その理由（2014年7月の料率改定の地域差など）は、このデータだけでは確かめられません。
+
+## (B) (9) の係数の変化の分解
+
+(9) では、時変の統制変数（その年の log年収・log金融資産・同居人数）のどれかが欠測の観測が推定から落ちています。「統制変数を入れたこと」と「標本が変わったこと」を分けるため、(9) と同じ観測だけで主分析を推定し直し、統制変数を1つずつ加えます。
+
+```{r tv-decomp}
+# 表の1行目の先頭のセルが半角の「(」で始まると、日本語文書クラスの LaTeX でエラーになるため、
+# ラベルは全角の括弧（（a）など）にしている
+# 標本は、推定で実際に使われた観測（fixest の obs()）で決める。
+# NA 以外の理由（無限大の値など）で落ちる観測があっても、(a)・(9) と数が一致するようにするため。
+es9 <- es_main %>% filter(!is.na(y_eq))
+m_a0 <- feols(y_eq ~ treat_post | hh_id + survey_year, es9, notes = FALSE)
+es9  <- es9[obs(m_a0), ]                                    # 主分析で使われた観測
+m_90 <- feols(y_eq ~ treat_post + log_inc_t + log_fin_t + hh_size_t | hh_id + survey_year,
+              es9, notes = FALSE)
+es9 <- es9 %>%
+  mutate(miss_inc = is.na(log_inc_t), miss_fin = is.na(log_fin_t), miss_size = is.na(hh_size_t),
+         in9 = row_number() %in% obs(m_90),                  # (9) で使われた観測
+         drop_other = !in9 & !(miss_inc | miss_fin | miss_size),  # NA 以外の理由で落ちた観測
+         miss_any = as.numeric(!in9))
+d9 <- es9 %>% filter(in9)
+
+dec <- list(
+  "（a）主分析（全標本）"           = feols(y_eq ~ treat_post | hh_id + survey_year, es9, cluster = ~hh_id),
+  "（b）(9) と同じ観測、統制なし"   = feols(y_eq ~ treat_post | hh_id + survey_year, d9, cluster = ~hh_id),
+  "（c）（b）＋ log年収"             = feols(y_eq ~ treat_post + log_inc_t | hh_id + survey_year, d9, cluster = ~hh_id),
+  "（d）（c）＋ log金融資産"         = feols(y_eq ~ treat_post + log_inc_t + log_fin_t | hh_id + survey_year,
+                                           d9, cluster = ~hh_id),
+  "（e）（d）＋ 同居人数（＝(9)）"   = feols(y_eq ~ treat_post + log_inc_t + log_fin_t + hh_size_t |
+                                             hh_id + survey_year, d9, cluster = ~hh_id)
+)
+imap_dfr(dec, ~ tidy_fe(.x, keep = "treat_post", label = .y) %>%
+           mutate(obs = nobs(.x), hh = n_info(.x)["hh"])) %>%
+  transmute(推定 = model, 係数 = sprintf("%.3f", est), `95%信頼区間` = fmt_ci(lo, hi),
+            p値 = fmt_p(p), 観測数 = format(obs, big.mark = ","), 世帯数 = format(hh, big.mark = ",")) %>%
+  sh_kable(caption = "(9) の分解：DID 係数（treat × post）")
+
+# 統制変数の係数（（e））
+tidy_fe(dec[[5]]) %>% filter(term != "treat_post") %>%
+  transmute(変数 = recode(term, log_inc_t = "log(1+世帯年収)", log_fin_t = "log(1+金融資産)",
+                          hh_size_t = "同居人数"),
+            係数 = sprintf("%.4f", est), `95%信頼区間` = fmt_ci(lo, hi), p値 = fmt_p(p)) %>%
+  sh_kable(caption = "（e）の統制変数の係数（世帯FEの下での、年ごとの変動と加入の関連）")
+```
+
+**読み方**：（a）→（b）の変化が「標本が変わった影響」、（b）→（e）の変化が「統制変数を入れた影響」です。
+
+### 統制変数の欠測の内訳
+
+```{r tv-missing}
+miss_cell <- function(x) {   # 0/1 の割合。共有用では件数の小さいセルを伏せる
+  n <- length(x); k <- sum(x)
+  if (SHARE && (n < MIN_CELL || (k > 0 & k < MIN_CELL) || (n - k > 0 & n - k < MIN_CELL))) "—"
+  else sprintf("%.3f", k / n)
+}
+es9 %>%
+  group_by(群 = if_else(treat == 1, "被害あり", "被害なし"),
+           期間 = if_else(survey_year <= 2011, "震災前（2007〜2011年）", "震災後（2012〜2016年）")) %>%
+  summarise(観測数 = n(),
+            `いずれか欠測` = miss_cell(!in9),
+            `年収が欠測` = miss_cell(miss_inc),
+            `金融資産が欠測` = miss_cell(miss_fin),
+            `同居人数が欠測` = miss_cell(miss_size), .groups = "drop") %>%
+  mutate(観測数 = sh_n(観測数)) %>%
+  sh_kable(caption = "統制変数が欠測の観測の割合（地震保険の回答がある観測のうち）")
+
+m_miss <- feols(miss_any ~ treat_post | hh_id + survey_year, es9, cluster = ~hh_id)
+mm9 <- tidy_fe(m_miss, keep = "treat_post")
+```
+
+```{r tv-missing-txt, results='asis'}
+cat(sprintf("**欠測そのものの DID**（目的変数＝統制変数のいずれかが欠測なら1）：%.3f（95%%信頼区間 %s、p = %s）。被害あり世帯で震災後に欠測が増えていれば、(9) の標本は「欠測しなかった被害世帯」に偏っています。\n",
+            mm9$est, fmt_ci(mm9$lo, mm9$hi), fmt_p(mm9$p)))
+cat(sprintf("\n(9) で落ちた観測は %s で、そのうち統制変数が NA ではないのに落ちた観測（無限大の値など）は %s です。\n",
+            sh_n(sum(!es9$in9)), sh_n(sum(es9$drop_other))))
+```
+
+### 観測が落ちたことによる係数の変化
+
+次の3つで調べます。
+
+1. **欠測がランダムでも、この程度は動くか**：(9) で落ちたのと同じ数の観測をランダムに落として DID を推定することを500回くり返し、係数のばらつきを見ます。「単純」は全体から同じ数をランダムに落とすもの、「層別」は被害あり・なし × 震災前・後のそれぞれで、実際に落ちたのと同じ数をランダムに落とすものです。(9) の係数がこの分布の中ほどにあれば、係数の変化は「どの観測がたまたま落ちたか」で説明できます。
+2. **落ちた観測は、残った観測と加入率が違うか**：被害あり・なし × 震災前・後で比べます。
+3. **どの観測が落ちたことが効いているか**：(9) の標本に、落ちた観測を群・期間ごとに1つずつ戻して推定し直します（効果は足し算にならないので目安）。
+
+```{r tv-why}
+did_coef <- function(d) {
+  coef(feols(y_eq ~ treat_post | hh_id + survey_year, d,
+             vcov = "iid", lean = TRUE, notes = FALSE))[["treat_post"]]
+}
+es9 <- es9 %>%
+  mutate(群 = if_else(treat == 1, "被害あり", "被害なし"),
+         期間 = if_else(survey_year <= 2011, "震災前", "震災後"),
+         cell = paste(群, 期間, sep = "・"))
+b_full <- did_coef(es9)
+b_9    <- did_coef(filter(es9, in9))
+n_drop <- sum(!es9$in9)
+
+set.seed(20261105)   # 結果を再現できるように乱数の種を固定
+R_SIM <- 500
+sim_simple <- replicate(R_SIM, did_coef(es9[-sample.int(nrow(es9), n_drop), ]))
+sim_strat  <- replicate(R_SIM, {
+  es9 %>% group_by(cell) %>%
+    mutate(.out = row_number() %in% sample.int(n(), sum(!in9))) %>%
+    ungroup() %>% filter(!.out) %>% did_coef()
+})
+
+sim_row <- function(x, nm) tibble(
+  方法 = nm, 平均 = mean(x), 標準偏差 = sd(x),
+  `2.5%点` = unname(quantile(x, 0.025)), `97.5%点` = unname(quantile(x, 0.975)),
+  `(9)の係数以下になった割合` = mean(x <= b_9))
+bind_rows(sim_row(sim_simple, "単純（全体から同じ数を落とす）"),
+          sim_row(sim_strat,  "層別（群×期間ごとに同じ数を落とす）")) %>%
+  sh_kable(caption = sprintf("ランダムに %s 観測を落としたときの DID 係数（%d 回）。全標本 %.3f、(9) の標本 %.3f",
+                             format(n_drop, big.mark = ","), R_SIM, b_full, b_9), digits = 3)
+```
+
+```{r tv-why-fig, fig.height=3}
+tibble(b = c(sim_simple, sim_strat),
+       method = rep(c("Simple random", "Stratified random"), each = R_SIM)) %>%
+  ggplot(aes(b)) +
+  geom_histogram(bins = 30) +
+  geom_vline(xintercept = b_full, linewidth = 0.4) +
+  geom_vline(xintercept = b_9, linetype = "dashed", linewidth = 0.4) +
+  facet_wrap(~ method) +
+  labs(x = "DID coefficient after random deletion (solid: full sample, dashed: sample of (9))",
+       y = "Count") +
+  theme_minimal()
+```
+
+```{r tv-why-cells}
+# 落ちた観測と残った観測の加入率（共有用では件数の小さいセルを伏せる）
+rate_cell <- function(y) {
+  n <- length(y); k <- sum(y)
+  if (SHARE && (n < MIN_CELL || (k > 0 & k < MIN_CELL) || (n - k > 0 & n - k < MIN_CELL))) "—"
+  else sprintf("%.3f", k / n)
+}
+es9 %>%
+  group_by(群, 期間) %>%
+  summarise(`落ちた観測の数` = sum(!in9),
+            `落ちた観測の加入率` = rate_cell(y_eq[!in9]),
+            `残った観測の加入率` = rate_cell(y_eq[in9]), .groups = "drop") %>%
+  mutate(`落ちた観測の数` = sh_n(`落ちた観測の数`)) %>%
+  sh_kable(caption = "(9) で落ちた観測と残った観測の地震保険加入率")
+
+# 落ちた観測を群×期間ごとに戻す
+d9_only <- filter(es9, in9)
+back <- map_dfr(sort(unique(es9$cell)), function(cc) {
+  b <- did_coef(bind_rows(d9_only, filter(es9, !in9, cell == cc)))
+  tibble(`戻した観測` = paste0(cc, "で落ちた観測"), 係数 = b, `(9)の標本からの変化` = b - b_9)
+})
+bind_rows(tibble(`戻した観測` = "なし（(9)の標本）", 係数 = b_9, `(9)の標本からの変化` = 0),
+          back,
+          tibble(`戻した観測` = "すべて（全標本）", 係数 = b_full, `(9)の標本からの変化` = b_full - b_9)) %>%
+  sh_kable(caption = "落ちた観測を群×期間ごとに戻したときの DID 係数", digits = 3)
+```
+
+**読み方**：
+
+- 1つ目の表で、(9) の係数がランダムに落としたときの 2.5〜97.5% の範囲に入っていれば、欠測がランダムでも、この程度の変化は起こりうる大きさです。標準偏差が「観測を1割落としたときに係数がどれだけ動くか」の目安です。
+- 2つ目の表で、例えば被害あり・震災前の落ちた観測の加入率が、残った観測より低ければ、それが抜けたことで被害あり世帯の震災前の水準が上がり、DID が小さくなります。
+- 3つ目の表で、戻したときに係数が最も大きく動く群・期間が、変化の主な出どころです。
+
+# 傾向スコアマッチング（PSM）
+
+## 傾向スコアの推定とマッチング
+
+```{r psm}
+psm_formula <- treat ~ log_inc_imp + log_inc_miss + log_fin_imp + log_fin_miss +
+  age_imp + married_imp + hh_size_imp + mortgage_imp + condo_imp + leasehold_imp +
+  bldg_age_imp + bldg_age_miss + big_city_imp + town_imp
+
+add_region3 <- function(d) d %>%
+  mutate(region3 = case_when(region == 2 ~ "東北", region == 3 ~ "関東", TRUE ~ "その他"))
+
+psm11 <- add_region3(psm11)
+psm07 <- add_region3(psm07)
+
+do_match <- function(d) {
+  matchit(psm_formula, data = d, method = "nearest", distance = "glm",
+          ratio = 2, replace = FALSE, caliper = 0.2, std.caliper = TRUE,
+          exact = ~ region3)
+}
+m11 <- do_match(psm11)
+md11 <- match.data(m11)            # weights 列つき
+
+tibble(群 = c("被害あり", "被害なし"),
+       `マッチング前` = c(sum(psm11$treat == 1), sum(psm11$treat == 0)),
+       `マッチング後` = c(sum(md11$treat == 1), sum(md11$treat == 0))) %>%
+  mutate(`マッチング前` = sh_n(`マッチング前`),
+         `マッチング後` = sh_n_compl(c(sum(md11$treat == 1), sum(md11$treat == 0)),
+                                     c(sum(psm11$treat == 1), sum(psm11$treat == 0)))) %>%
+  sh_kable(caption = "マッチングの結果（被害なしは被害あり1世帯に最大2世帯）")
+```
+
+マッチング後の被害あり世帯数がマッチング前より少ない場合、キャリパーの範囲に対照の世帯が見つからなかった世帯が落ちています。結果は「マッチングできた被害世帯」についてのものになります。
+
+## マッチング前後のバランス
+
+```{r psm-balance}
+bal <- summary(m11, standardize = TRUE)
+b_before <- as.data.frame(bal$sum.all)
+b_after  <- as.data.frame(bal$sum.matched)
+tibble(変数 = rownames(b_before),
+       `標準化差（前）` = b_before[, "Std. Mean Diff."],
+       `標準化差（後）` = b_after[rownames(b_before), "Std. Mean Diff."]) %>%
+  mutate(変数 = if_else(変数 == "distance", "傾向スコア", 変数)) %>%
+  sh_kable(caption = "マッチング前後の標準化差（絶対値0.1未満が目安。地域は完全一致させている）", digits = 3)
+```
+
+## マッチング標本でのイベントスタディ（頑健性 (7)）
+
+```{r psm-es}
+w11 <- md11 %>% select(hh_id, w_psm = weights)
+es_m <- es_main %>% inner_join(w11, by = "hh_id")
+
+m_es_psm  <- feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year,
+                   data = es_m, weights = ~w_psm, cluster = ~hh_id)
+m_did_psm <- feols(y_eq ~ treat_post | hh_id + survey_year,
+                   data = es_m, weights = ~w_psm, cluster = ~hh_id)
+
+psm_tab <- bind_rows(
+  tidy_fe(m_es, label = "全標本"),
+  tidy_fe(m_es_psm, label = "マッチング標本")) %>%
+  mutate(k = as.integer(sub("^k::(-?[0-9]+):treat$", "\\1", term))) %>%
+  filter(!is.na(k))
+
+psm_tab %>%
+  mutate(値 = sprintf("%.3f %s", est, fmt_ci(lo, hi))) %>%
+  select(model, k, 値) %>%
+  pivot_wider(names_from = model, values_from = 値) %>%
+  arrange(k) %>% rename(相対年k = k) %>%
+  sh_kable(caption = "全標本とマッチング標本のイベントスタディ係数（95%信頼区間）")
+
+d <- tidy_fe(m_did_psm, keep = "treat_post")
+```
+
+```{r psm-es-txt, results='asis'}
+cat(sprintf("**マッチング標本の DID 係数**：%.3f（95%%信頼区間 %s、p = %s）。\n", d$est, fmt_ci(d$lo, d$hi), fmt_p(d$p)))
+```
+
+```{r psm-es-fig, fig.height=3.4}
+psm_tab %>%
+  bind_rows(tibble(model = c("全標本", "マッチング標本"), k = -1L, est = 0, lo = 0, hi = 0)) %>%
+  mutate(model = recode(model, "全標本" = "Full sample", "マッチング標本" = "PSM matched")) %>%
+  ggplot(aes(k + if_else(model == "Full sample", -0.12, 0.12), est, shape = model)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.1) +
+  geom_point() +
+  scale_x_continuous(breaks = -5:4) +
+  labs(x = "k (survey year - 2012)", y = "Coefficient", shape = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+## PSMの妥当性の確認
+
+**(a) 年収の変化**：被害が年収を変えていれば、年収をマッチング変数に使う第2段階の前提が崩れます。2013年調査（2012年分）を主に見ます。
+
+```{r psm-check-a}
+chk_a <- list(
+  "2011→2013年調査（全標本）"       = lm(d_loginc_11_s13 ~ treat, data = psm11),
+  "2011→2013年調査（マッチング標本）" = lm(d_loginc_11_s13 ~ treat, data = md11, weights = weights),
+  "2011→2012年調査（全標本、参考）"   = lm(d_loginc_11_s12 ~ treat, data = psm11))
+imap_dfr(chk_a, function(m, nm) {
+  ci <- confint(m)["treat", ]
+  tibble(比較 = nm, `被害ありとの差（log）` = sprintf("%.3f", coef(m)["treat"]),
+         `95%信頼区間` = fmt_ci(ci[1], ci[2]),
+         p値 = fmt_p(summary(m)$coefficients["treat", 4]),
+         観測数 = format(nobs(m), big.mark = ","))
+}) %>% sh_kable(caption = "log(1+世帯年収) の変化の、被害あり・なしの差")
+```
+
+**(b) プラセボ（震災前の窓）**：2007年調査の共変量で同じPSMを行い、2007→2011年の加入の変化を比べます。震災前なので、差は0のはずです。
+
+```{r psm-check-b}
+m07  <- do_match(psm07)
+md07 <- match.data(m07)
+chk_b <- list(
+  "全標本"         = lm(d_eq_07_11 ~ treat, data = psm07),
+  "マッチング標本" = lm(d_eq_07_11 ~ treat, data = md07, weights = weights))
+imap_dfr(chk_b, function(m, nm) {
+  ci <- confint(m)["treat", ]
+  tibble(標本 = nm, `加入の変化の差` = sprintf("%.3f", coef(m)["treat"]),
+         `95%信頼区間` = fmt_ci(ci[1], ci[2]),
+         p値 = fmt_p(summary(m)$coefficients["treat", 4]),
+         観測数 = format(nobs(m), big.mark = ","))
+}) %>% sh_kable(caption = "プラセボ：2007→2011年の加入の変化（被害あり − 被害なし）")
+```
+
+## 11月5日に追加したPSM（学歴・危険回避度を加え、築年数の扱いを変える）
+
+**結果を見た後に追加した指定です。**事前に決めた頑健性 (7) は上のとおり残し、ここでは次の2つを並べて報告します。
+
+| 指定 | 共変量 |
+|---|---|
+| 11/5-A | (7) の共変量から築年数を除き、学歴・危険回避度を加える |
+| 11/5-B | 11/5-A に、築年数を3区分（1981年以前の建物／それ以降／不明）にして加える |
+
+- **加えた変数**：学歴（入った年の夫婦のうち長いほうの教育年数 `educ_years_max`）と危険回避度（2009年の傘を持つ降水確率 `risk_umb09_r`、対象者）。地震保険の先行研究で加入と関連するとされる変数で、震災前に測られている。欠測は他の変数と同じく中央値で埋め、欠測ダミーを加える。
+- **築年数の扱い**：(7) では、築年数（欠測は中央値で埋める）を連続の変数として入れたところ、マッチング後に標準化差が悪化した。11/5-A のように築年数を外すと、さらに悪化した（地域・マンション・政令市などでそろえると、築年数の古い対照が選ばれやすいため）。11/5-B では、1981年6月以降の建物の保険料割引（耐震基準の切り替え）に合わせ、**調査時点で築（調査年 − 1981）年以上＝1981年以前の建物**（2011年調査なら築30年以上、2007年調査なら築26年以上）、それ未満、不明 の3区分にする。築年数は年単位の回答なので、境目の前後1年は区分を誤りうる。
+- マッチングの方法（地域の完全一致、1対2、非復元、キャリパー0.2）は (7) と同じ。
+- 震災前の窓のプラセボは、2007年調査の共変量で同じ指定を行う。危険回避度は2009年の値なので、2007→2011年の窓の途中に測られている点に注意。
+
+```{r psm2-prep}
+pnl <- readRDS(params$panel_file)
+if (!all(c("educ_years_max", "risk_umb09_r") %in% names(pnl))) {
+  stop("前処理済みパネルに学歴・危険回避度の列がありません。11/5版の khps_preprocess.Rmd を先に実行してください。")
+}
+er_2011 <- pnl %>% filter(survey_year == 2011) %>%
+  distinct(hh_id, .keep_all = TRUE) %>%
+  select(hh_id, educ_years_max, risk_umb09_r)
+bld <- pnl %>% filter(survey_year %in% c(2007, 2011)) %>%
+  distinct(hh_id, survey_year, .keep_all = TRUE) %>%
+  select(hh_id, survey_year, bldg_age)
+rm(pnl)
+
+add_er <- function(d) {
+  d %>% select(-any_of(c("educ_years_max", "risk_umb09_r"))) %>%
+    left_join(er_2011, by = "hh_id") %>%
+    mutate(educ_miss = as.numeric(is.na(educ_years_max)),
+           educ_imp  = if_else(is.na(educ_years_max), median(educ_years_max, na.rm = TRUE), educ_years_max),
+           risk_miss = as.numeric(is.na(risk_umb09_r)),
+           risk_imp  = if_else(is.na(risk_umb09_r), median(risk_umb09_r, na.rm = TRUE), risk_umb09_r))
+}
+# 築年数の3区分（y は共変量を測った調査年）。基準は「1981年より後の建物」
+add_bldg3 <- function(d, y) {
+  b <- bld %>% filter(survey_year == y) %>% select(hh_id, bldg_age_raw = bldg_age)
+  d %>% select(-any_of("bldg_age_raw")) %>%
+    left_join(b, by = "hh_id") %>%
+    mutate(bldg_pre1981 = as.numeric(!is.na(bldg_age_raw) & bldg_age_raw >= (y - 1981)),
+           bldg_unknown = as.numeric(is.na(bldg_age_raw)))
+}
+psm11b <- psm11 %>% add_er() %>% add_bldg3(2011)
+psm07b <- psm07 %>% add_er() %>% add_bldg3(2007)
+
+psm_formula2 <- treat ~ log_inc_imp + log_inc_miss + log_fin_imp + log_fin_miss +
+  age_imp + married_imp + hh_size_imp + mortgage_imp + condo_imp + leasehold_imp +
+  big_city_imp + town_imp + educ_imp + educ_miss + risk_imp + risk_miss
+psm_formula3 <- update(psm_formula2, . ~ . + bldg_pre1981 + bldg_unknown)
+
+do_match_f <- function(d, f) {
+  matchit(f, data = d, method = "nearest", distance = "glm",
+          ratio = 2, replace = FALSE, caliper = 0.2, std.caliper = TRUE,
+          exact = ~ region3)
+}
+m11b <- do_match_f(psm11b, psm_formula2); md11b <- match.data(m11b)   # 11/5-A
+m11c <- do_match_f(psm11b, psm_formula3); md11c <- match.data(m11c)   # 11/5-B
+
+tibble(群 = c("被害あり", "被害なし"),
+       `マッチング前` = sh_n(c(sum(psm11b$treat == 1), sum(psm11b$treat == 0))),
+       `11/5-A 後` = sh_n_compl(c(sum(md11b$treat == 1), sum(md11b$treat == 0)),
+                                c(sum(psm11b$treat == 1), sum(psm11b$treat == 0))),
+       `11/5-B 後` = sh_n_compl(c(sum(md11c$treat == 1), sum(md11c$treat == 0)),
+                                c(sum(psm11b$treat == 1), sum(psm11b$treat == 0)))) %>%
+  sh_kable(caption = "11/5のPSM：マッチングの結果")
+
+# バランス：A・B とも、築年数（連続・3区分）を並べて載せる
+smd_tab <- function(m) {
+  s <- summary(m, standardize = TRUE,
+               addlvariables = ~ bldg_age_imp + bldg_pre1981 + bldg_unknown, data = psm11b)
+  b <- as.data.frame(s$sum.all); a <- as.data.frame(s$sum.matched)
+  tibble(変数 = rownames(b), 前 = b[, "Std. Mean Diff."], 後 = a[rownames(b), "Std. Mean Diff."])
+}
+bal_a <- smd_tab(m11b); bal_c <- smd_tab(m11c)
+bal_a %>% select(変数, `標準化差（前）` = 前, `11/5-A 後` = 後) %>%
+  left_join(bal_c %>% select(変数, `11/5-B 後` = 後), by = "変数") %>%
+  distinct(変数, .keep_all = TRUE) %>%
+  mutate(変数 = case_when(変数 == "distance" ~ "傾向スコア",
+                          変数 == "bldg_age_imp" ~ "bldg_age_imp（築年数・連続。A・Bとも不使用）",
+                          変数 %in% c("bldg_pre1981", "bldg_unknown") ~ paste0(変数, "（Bのみ使用）"),
+                          TRUE ~ 変数)) %>%
+  sh_kable(caption = "11/5のPSM：マッチング前後の標準化差（絶対値0.1未満が目安）", digits = 3)
+```
+
+### マッチング後の加入率の推移（11/5-B）
+
+マッチング標本の被害あり・なしの加入率を、マッチングの重み（被害なし世帯は被害あり世帯1世帯に対して最大2世帯なので、重みで調整）を付けて年ごとに示します。**震災前（2007〜2011年）の推移が平行か**を見るのが目的です。比較のため、11/5-A と (7) の差も並べます。
+
+```{r psm2-trend}
+w11b <- md11b %>% select(hh_id, w_psm2 = weights)
+w11c <- md11c %>% select(hh_id, w_psm3 = weights)
+es_m2 <- es_main %>% inner_join(w11b, by = "hh_id")
+es_m3 <- es_main %>% inner_join(w11c, by = "hh_id")
+es_m1 <- es_main %>% inner_join(w11,  by = "hh_id")
+
+trend_by <- function(d, wvar) {
+  d %>% filter(!is.na(y_eq)) %>%
+    group_by(survey_year, 群 = if_else(treat == 1, "被害あり", "被害なし")) %>%
+    summarise(n = n(), k1 = sum(y_eq), rate = weighted.mean(y_eq, .data[[wvar]]), .groups = "drop") %>%
+    mutate(hide = SHARE & (n < MIN_CELL | (k1 > 0 & k1 < MIN_CELL) | (n - k1 > 0 & n - k1 < MIN_CELL)))
+}
+gap_by <- function(tr) {
+  tr %>% select(survey_year, 群, rate, hide) %>%
+    pivot_wider(names_from = 群, values_from = c(rate, hide)) %>%
+    transmute(調査年 = survey_year,
+              gap = if_else(hide_被害あり | hide_被害なし, NA_real_, rate_被害あり - rate_被害なし))
+}
+tr3 <- trend_by(es_m3, "w_psm3")
+fmt_gap <- function(x) if_else(is.na(x), "—", sprintf("%+.3f", x))
+
+tr3 %>%
+  mutate(v = if_else(hide, "—", sprintf("%.3f", rate))) %>%
+  select(調査年 = survey_year, 群, v) %>%
+  pivot_wider(names_from = 群, values_from = v) %>%
+  left_join(gap_by(tr3) %>% rename(`差（B）` = gap), by = "調査年") %>%
+  left_join(gap_by(trend_by(es_m2, "w_psm2")) %>% rename(`差（A）` = gap), by = "調査年") %>%
+  left_join(gap_by(trend_by(es_m1, "w_psm")) %>% rename(`差（(7)）` = gap), by = "調査年") %>%
+  mutate(across(starts_with("差"), fmt_gap)) %>%
+  sh_kable(caption = "11/5-B のマッチング標本の加入率（重み付き）と、被害あり − 被害なしの差（A・(7) も並べる）")
+
+n3 <- tr3 %>% select(調査年 = survey_year, 群, n) %>% pivot_wider(names_from = 群, values_from = n)
+sh_kable(sh_mask_counts(as.data.frame(n3), c("被害あり", "被害なし"), secondary = FALSE),
+         caption = "11/5-B の表の観測世帯数")
+```
+
+```{r psm2-trend-fig, fig.height=3.4}
+tr3 %>% filter(!hide) %>%
+  mutate(group = if_else(群 == "被害あり", "Damaged", "Not damaged (matched, weighted)")) %>%
+  ggplot(aes(survey_year, rate, linetype = group, shape = group)) +
+  geom_vline(xintercept = 2011.5, linewidth = 0.3) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = 2007:2016) +
+  labs(x = "Survey year (January)", y = "Earthquake insurance take-up", linetype = NULL, shape = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### 震災前の推移の検定
+
+2つの方法で確かめます。(i) イベントスタディで、震災前の係数（k=−5〜−2）がすべて0かの検定。(ii) 震災前（2007〜2011年）だけを使い、被害あり世帯の加入率が1年あたり余分にどれだけ伸びていたか（傾きの差）の推定。
+
+**p値の読み方の注意**：マッチング標本は全標本より世帯数がずっと少ないので、信頼区間が広くなり、同じだけずれていても p値は大きく出ます。**p値が大きいことは、推移がそろっていることの証拠にはなりません。**そろい具合は、傾きの差の点推定と信頼区間の幅で比べてください。
+
+```{r psm2-pretest}
+m_es_psm2  <- feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year,
+                    data = es_m2, weights = ~w_psm2, cluster = ~hh_id)
+m_did_psm2 <- feols(y_eq ~ treat_post | hh_id + survey_year,
+                    data = es_m2, weights = ~w_psm2, cluster = ~hh_id)
+m_es_psm3  <- feols(y_eq ~ i(k, treat, ref = -1) | hh_id + survey_year,
+                    data = es_m3, weights = ~w_psm3, cluster = ~hh_id)
+m_did_psm3 <- feols(y_eq ~ treat_post | hh_id + survey_year,
+                    data = es_m3, weights = ~w_psm3, cluster = ~hh_id)
+
+pre_f <- function(m) {
+  w <- tryCatch(wald(m, keep = "^k::-[2-5]:treat$", print = FALSE), error = function(e) NULL)
+  if (is.null(w)) c(F = NA, p = NA) else c(F = w$stat, p = w$p)
+}
+slope <- function(d, wvar = NULL) {
+  d <- d %>% filter(survey_year <= 2011) %>% mutate(trend_treat = treat * (survey_year - 2011))
+  m <- if (is.null(wvar)) feols(y_eq ~ trend_treat | hh_id + survey_year, d, cluster = ~hh_id)
+       else feols(y_eq ~ trend_treat | hh_id + survey_year, d, weights = as.formula(paste0("~", wvar)),
+                  cluster = ~hh_id)
+  tidy_fe(m, keep = "trend_treat")
+}
+pre_rows <- list(
+  list(nm = "全標本",               es = m_es,      sl = slope(es_main)),
+  list(nm = "(7) のマッチング標本", es = m_es_psm,  sl = slope(es_m1, "w_psm")),
+  list(nm = "11/5-A のマッチング標本", es = m_es_psm2, sl = slope(es_m2, "w_psm2")),
+  list(nm = "11/5-B のマッチング標本", es = m_es_psm3, sl = slope(es_m3, "w_psm3")))
+map_dfr(pre_rows, function(r) {
+  f <- pre_f(r$es)
+  tibble(標本 = r$nm,
+         `震災前の係数＝0の検定 F` = sprintf("%.2f", f["F"]), `p値（F）` = fmt_p(f["p"]),
+         `傾きの差（1年あたり）` = sprintf("%.4f", r$sl$est), `95%信頼区間` = fmt_ci(r$sl$lo, r$sl$hi),
+         `区間の幅` = sprintf("%.3f", r$sl$hi - r$sl$lo),
+         `p値（傾き）` = fmt_p(r$sl$p))
+}) %>% sh_kable(caption = "震災前の推移の確認（被害あり − 被害なし）")
+```
+
+### マッチング標本でのイベントスタディ
+
+```{r psm2-es}
+bind_rows(tidy_fe(m_es, label = "全標本"),
+          tidy_fe(m_es_psm, label = "(7)"),
+          tidy_fe(m_es_psm2, label = "11/5-A"),
+          tidy_fe(m_es_psm3, label = "11/5-B")) %>%
+  mutate(k = as.integer(sub("^k::(-?[0-9]+):treat$", "\\1", term))) %>%
+  filter(!is.na(k)) %>%
+  mutate(値 = sprintf("%.3f %s", est, fmt_ci(lo, hi))) %>%
+  select(model, k, 値) %>%
+  pivot_wider(names_from = model, values_from = 値) %>%
+  arrange(k) %>% rename(相対年k = k) %>%
+  sh_kable(caption = "イベントスタディ係数の比較（95%信頼区間）")
+
+did_rows <- list("(7)" = m_did_psm, "11/5-A" = m_did_psm2, "11/5-B" = m_did_psm3)
+
+# プラセボ（震災前の窓）
+plc <- map(list("11/5-A" = psm_formula2, "11/5-B" = psm_formula3), function(f) {
+  md <- match.data(do_match_f(psm07b, f))
+  lm(d_eq_07_11 ~ treat, data = md, weights = weights)
+})
+```
+
+```{r psm2-es-txt}
+bind_rows(
+  imap_dfr(did_rows, ~ tidy_fe(.x, keep = "treat_post") %>% mutate(指定 = .y, 種類 = "DID（震災後をまとめた係数）")),
+  imap_dfr(plc, function(m, nm) {
+    ci <- confint(m)["treat", ]
+    tibble(est = coef(m)["treat"], lo = ci[1], hi = ci[2], p = summary(m)$coefficients["treat", 4],
+           指定 = nm, 種類 = "プラセボ（2007→2011年の加入の変化）")
+  })) %>%
+  transmute(種類, 指定, 係数 = sprintf("%.3f", est), `95%信頼区間` = fmt_ci(lo, hi), p値 = fmt_p(p)) %>%
+  sh_kable(caption = "マッチング標本の DID 係数とプラセボ")
+```
+
+```{r psm2-es-fig, fig.height=3.4}
+bind_rows(tidy_fe(m_es, label = "Full sample"), tidy_fe(m_es_psm3, label = "PSM (11/5-B)")) %>%
+  mutate(k = as.integer(sub("^k::(-?[0-9]+):treat$", "\\1", term))) %>%
+  filter(!is.na(k)) %>%
+  bind_rows(tibble(model = c("Full sample", "PSM (11/5-B)"), k = -1L, est = 0, lo = 0, hi = 0)) %>%
+  ggplot(aes(k + if_else(model == "Full sample", -0.12, 0.12), est, shape = model)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.1) +
+  geom_point() +
+  scale_x_continuous(breaks = -5:4) +
+  labs(x = "k (survey year - 2012)", y = "Coefficient", shape = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+**読み方**：
+
+- 推移の表・図で、震災前（2007〜2011年）の被害あり・なしの差が年によって大きく動かなければ、平行トレンドの前提がもっともらしいと言えます。
+- 「傾きの差」は、点推定が0に近く、信頼区間の幅が狭いほど、震災前の推移がそろっていたと言えます。p値だけで判断しないでください。
+- 築年数のバランスは、連続の値（`bldg_age_imp`）と3区分の両方で確かめます。
+- 結果を見た後に追加した指定なので、(7) より良い結果が出ても、こちらを主にはしません。
+
+# 補助：「加入を考えた」はその後の加入につながったか
+
+GEES第1回 問2(1)で震災前に未加入と答えた世帯を、「加入を考えた」「考えなかった」に分け、2012〜2016年に一度でも加入と答えた割合を、被害の有無別に示します（記述）。
+
+```{r intent}
+intent_tab <- psm11 %>%
+  filter(!is.na(intent_w1)) %>%
+  mutate(later_any = as.numeric(if_any(c(eq_2012, eq_2013, eq_2014, eq_2015, eq_2016), ~ .x %in% 1)),
+         later_obs = if_any(c(eq_2012, eq_2013, eq_2014, eq_2015, eq_2016), ~ !is.na(.x))) %>%
+  filter(later_obs) %>%
+  group_by(被害 = if_else(treat == 1, "被害あり", "被害なし"),
+           意向 = if_else(intent_w1 == 1, "加入を考えた", "考えなかった")) %>%
+  summarise(n = n(), k1 = sum(later_any), 割合 = mean(later_any), .groups = "drop")
+
+intent_tab %>%
+  mutate(`2012〜16年に加入` = {
+           x <- sh_stat(割合, n)
+           if (SHARE) x[k1 < MIN_CELL | (n - k1) < MIN_CELL] <- "—"
+           x },
+         世帯数 = sh_n(n)) %>%
+  select(被害, 意向, 世帯数, `2012〜16年に加入`) %>%
+  sh_kable(caption = "震災前未加入（GEES第1回）の世帯の、その後の加入")
+```
+
+# 保存
+
+```{r save}
+all_coef <- bind_rows(
+  imap_dfr(specs, ~ tidy_fe(.x, label = .y)),
+  imap_dfr(did_specs, ~ tidy_fe(.x, label = paste0(.y, "（DID）"))),
+  tidy_fe(m_es_psm, label = "(7) PSMマッチング標本"),
+  tidy_fe(m_did_psm, label = "(7) PSMマッチング標本（DID）"),
+  imap_dfr(reg_did, ~ tidy_fe(.x, label = paste0("11/5 (A) ", .y, "（DID）"))),
+  tidy_fe(reg_es_kanto, label = "11/5 (A) 関東の世帯だけ"),
+  imap_dfr(dec, ~ tidy_fe(.x, label = paste0("11/5 (B) ", .y, "（DID）"))),
+  tidy_fe(m_miss, label = "11/5 (B) 欠測のDID"),
+  tidy_fe(m_es_psm2, label = "11/5-A PSM（学歴・危険回避度、築年数なし）"),
+  tidy_fe(m_did_psm2, label = "11/5-A PSM（学歴・危険回避度、築年数なし）（DID）"),
+  tidy_fe(m_es_psm3, label = "11/5-B PSM（学歴・危険回避度、築年数3区分）"),
+  tidy_fe(m_did_psm3, label = "11/5-B PSM（学歴・危険回避度、築年数3区分）（DID）"))
+readr::write_csv(all_coef, file.path(params$out_dir, "rq1_coefficients.csv"))
+cat("係数（全指定）を rq1_coefficients.csv に保存しました。\n")
+```
+
+```{r session, echo=FALSE}
+cat("R:", R.version.string, " fixest:", as.character(packageVersion("fixest")),
+    " MatchIt:", as.character(packageVersion("MatchIt")), "\n")
+```

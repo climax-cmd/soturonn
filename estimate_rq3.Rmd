@@ -1,0 +1,379 @@
+---
+title: "研究課題3の推定：震災前加入世帯の加入の継続と、不満・被害"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+documentclass: bxjsarticle
+classoption:
+  - xelatex
+  - ja=standard
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+params:
+  in_dir: "/home/rstudio/works/output/analysis"    # rq3_data.Rmd の出力先
+  out_dir: "/home/rstudio/works/output/estimates"  # 係数表（CSV）の保存先
+  share_mode: false
+  min_cell: 10
+  show_code: false
+---
+
+<!--
+==============================================================================
+実行コマンド（RStudio のコンソールにそのまま貼る）
+Sys.setlocale("LC_CTYPE", "C.UTF-8")
+setwd("/home/rstudio/khps_preprocess")
+
+# 1) 自分用
+rmarkdown::render("estimate_rq3.Rmd",
+                  output_dir = "/home/rstudio/works/output/reports",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = FALSE))
+
+# 2) 共有用（目で確認してから Claude outputs に移す）
+rmarkdown::render("estimate_rq3.Rmd",
+                  output_file = "estimate_rq3_share.pdf",
+                  output_dir = "/home/rstudio/works/share_check",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = TRUE, min_cell = 10))
+
+前提：先に rq3_data.Rmd を実行して rq3_windows.rds を作っておく。
+※ RStudio の Knit ボタンは使わない。
+==============================================================================
+-->
+
+```{r setup, include=FALSE}
+source("share_utils.R")
+SHARE    <- isTRUE(params$share_mode)
+MIN_CELL <- params$min_cell
+
+knitr::opts_chunk$set(echo = params$show_code, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 3.5)
+if (!requireNamespace("fixest", quietly = TRUE)) {
+  stop("パッケージ fixest がありません。コンソールで install.packages(\"fixest\") を実行してください。")
+}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+library(fixest)
+
+sh_check_dir(params$out_dir)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+
+fmt_ci <- function(lo, hi) sprintf("[%.3f, %.3f]", lo, hi)
+fmt_p  <- function(p) format.pval(p, digits = 3, eps = 0.001)
+```
+
+```{r banner, results='asis'}
+sh_banner()
+```
+
+# この文書について
+
+研究課題3（震災前に地震保険に加入していた世帯での、その後の加入の継続と、不満・被害との関連）を推定します。**推定の指定は結果を見る前に決めたもの（11月6日）で、結果はすべて報告します。**
+
+| 区分 | 内容 |
+|---|---|
+| 推定対象 | 地震保険制度への不満がある世帯とない世帯の、その後の加入率の差が、震災前の窓から震災後の窓でどれだけ変わったか（**関連**として解釈） |
+| 観測単位 | 世帯 × 窓 × 追跡する調査年（`rq3_windows.rds`） |
+| 標本 | 2011年に持家、GEES第2回で不満の質問に回答し、窓の基準年に地震保険に加入していた世帯 |
+| 窓 | 震災前：2007年に加入 → 2008〜2011年。震災後：2011年に加入 → 2012〜2015年（頑健性は2016年まで） |
+| 目的変数 | 追跡する各調査年の地震保険加入（0/1）。観測された回答をそのまま使う |
+| 主な説明変数 | 不満あり（`dissat_any`、GEES第2回 問2(3)）× 震災後の窓 |
+| 統制変数 | 被害（GEES第1回）、2011年の log年収・log金融資産・年齢。いずれも不満より前に決まる。世帯の固定効果は入れない |
+| 固定効果 | 地域（東北・関東・その他）× 調査年。同じ地域・同じ年の中で、不満あり・なしを比べる |
+| 標準誤差 | 世帯でクラスタリング（同じ世帯が両方の窓・複数の年に入るため） |
+
+$$
+\text{加入}_{iwt} = \beta_1 \text{不満}_i + \beta_3 (\text{不満}_i \times \text{震災後}_w) + \gamma' X_i + \mu_{\text{地域}\times\text{年}} + \varepsilon_{iwt}
+$$
+
+- $\beta_1$：震災前の窓での、不満あり世帯と不満なし世帯の加入率の差（不満のある世帯がもともとやめやすかったか）
+- $\beta_1 + \beta_3$：震災後の窓での差
+- $\beta_3$：差の変化。**主に見る係数**
+- 震災前の窓は2008〜2011年、震災後の窓は2012〜2015年なので、「震災後の窓」のフラグと「基準年から何年後か」は調査年で決まり、地域×年の固定効果に吸収される（式に入れない）。調査年の固定効果は、2012年の質問形式の変更や2014年7月の保険料引き上げなど、その年に全世帯に共通の変化を取り除く。地域×年にすることで、地域ごとに年の動きが違うことも取り除く。
+
+**モデルの変更（11月6日）**：当初は「震災後の窓」のフラグ・基準年から何年後かの固定効果・地域の固定効果を入れていた。調査年の効果を取り除けず、地域ごとの年の動きの違いも考慮していなかったため、設計の見直しとして上の式に変えた（変更は新しいモデルの結果を見る前に決めた）。当初の指定の結果も「当初の指定（参考）」として並べる。
+
+**解釈の注意**
+
+- **逆の因果**：やめた（やめるつもりの）世帯が、理由として不満を答えた可能性がある。不満は2011年10月の質問で、震災後の窓の追跡（2012年1月以降）より前に測られているが、それでも因果とは言えない。
+- **回答のぶれ**：自己申告の加入には年ごとの回答のぶれがあるため、毎年の「非加入」には、本当にやめたことのほかに回答のぶれが含まれうる。
+- **質問形式の変更**：2012年から住居・家財別の質問になる。不満あり・なしで形式の影響が同じなら、差には影響しない。
+- **脱落**：回答のない年は観測がないだけとして扱う（指導教員との相談による）。
+
+```{r load}
+rq3 <- readRDS(file.path(params$in_dir, "rq3_windows.rds"))
+win_lv <- levels(rq3$window)
+if (is.null(win_lv)) win_lv <- c("震災前（2007→2008〜11年）", "震災後（2011→2012〜15年）",
+                                 "震災後・頑健性（2011→2012〜16年）")
+
+# 統制変数の欠測は、世帯単位の中央値で埋めて欠測ダミーを加える
+hh_med <- rq3 %>% distinct(hh_id, .keep_all = TRUE) %>%
+  summarise(inc = median(log1p(pmax(base_hh_inc, 0)), na.rm = TRUE),
+            fin = median(log1p(pmax(base_fin_assets, 0)), na.rm = TRUE),
+            age = median(base_age, na.rm = TRUE))
+rq3 <- rq3 %>%
+  mutate(dissat      = dissat_any,
+         damage      = coalesce(damage_any, 0),
+         damage_miss = as.numeric(is.na(damage_any)),
+         log_inc     = log1p(pmax(base_hh_inc, 0)),
+         log_fin     = log1p(pmax(base_fin_assets, 0)),
+         inc_miss    = as.numeric(is.na(log_inc)),
+         fin_miss    = as.numeric(is.na(log_fin)),
+         age_miss    = as.numeric(is.na(base_age)),
+         log_inc     = coalesce(log_inc, hh_med$inc),
+         log_fin     = coalesce(log_fin, hh_med$fin),
+         age         = coalesce(base_age, hh_med$age),
+         region3     = coalesce(region3, "不明"))
+
+d_main <- rq3 %>% filter(window %in% win_lv[1:2])          # 震災前 ＋ 震災後（2015年まで）
+d_rob  <- rq3 %>% filter(window %in% win_lv[c(1, 3)]) %>%   # 震災前 ＋ 震災後（2016年まで）
+  mutate(post_window = as.numeric(window == win_lv[3]))
+
+ctrl <- "damage + damage_miss + log_inc + inc_miss + log_fin + fin_miss + age + age_miss"
+```
+
+# 主分析：不満と加入の継続
+
+```{r main}
+# 震災後のフラグ（post_window）は調査年の固定効果に吸収されるので、交差項だけを入れる
+f_noc  <- eq_ins ~ dissat + dissat:post_window | region3^survey_year
+f_ctl  <- as.formula(paste("eq_ins ~ dissat + dissat:post_window +", ctrl, "| region3^survey_year"))
+f_yfe  <- as.formula(paste("eq_ins ~ dissat + dissat:post_window +", ctrl, "| survey_year + region3"))
+f_orig <- as.formula(paste("eq_ins ~ dissat * post_window +", ctrl, "| rel + region3"))
+
+mods <- list(
+  "統制なし"                       = feols(f_noc,  d_main, cluster = ~hh_id),
+  "主分析（統制あり）"             = feols(f_ctl,  d_main, cluster = ~hh_id),
+  "頑健性（2016年まで）"           = feols(f_ctl,  d_rob,  cluster = ~hh_id),
+  "頑健性（年FE＋地域FE）"         = feols(f_yfe,  d_main, cluster = ~hh_id),
+  "当初の指定（参考）"             = feols(f_orig, d_main, cluster = ~hh_id))
+
+# 係数と、b1+b3（震災後の窓での差）を計算する
+coef_rows <- function(m, nm, a = "dissat", b = "dissat:post_window") {
+  cf <- coef(m); V <- vcov(m); dfv <- fixest::degrees_freedom(m, "t")
+  one <- function(est, se, lab) {
+    tt <- est / se; crit <- qt(0.975, dfv)
+    tibble(推定 = nm, 係数 = lab, est = est, se = se,
+           lo = est - crit * se, hi = est + crit * se, p = 2 * pt(-abs(tt), dfv))
+  }
+  bind_rows(
+    one(cf[a], sqrt(V[a, a]), "震災前の窓での差（b1）"),
+    one(cf[a] + cf[b], sqrt(V[a, a] + V[b, b] + 2 * V[a, b]), "震災後の窓での差（b1＋b3）"),
+    one(cf[b], sqrt(V[b, b]), "差の変化（b3）")) %>%
+    mutate(観測数 = nobs(m))
+}
+n_hh_used <- function(m, d) n_distinct(d$hh_id[obs(m)])
+
+res_main <- imap_dfr(mods, function(m, nm) {
+  d <- if (grepl("2016", nm)) d_rob else d_main
+  coef_rows(m, nm) %>% mutate(世帯数 = n_hh_used(m, d))
+})
+
+res_main %>%
+  transmute(推定, 係数, 推定値 = sprintf("%.3f", est),
+            `95%信頼区間` = fmt_ci(lo, hi), p値 = fmt_p(p),
+            観測数 = format(観測数, big.mark = ","), 世帯数 = format(世帯数, big.mark = ",")) %>%
+  sh_kable(caption = "不満あり − 不満なしの加入率の差（線形確率モデル、世帯でクラスタリング）")
+```
+
+```{r main-txt, results='asis'}
+b3 <- res_main %>% filter(推定 == "主分析（統制あり）", 係数 == "差の変化（b3）")
+cat(sprintf("**主分析の差の変化（b3）**：%.3f（95%%信頼区間 %s、p = %s）。この標本で 5%%水準・検出力80%%で検出できる最小の差は、おおよそ 2.8 × 標準誤差 ＝ 約 %.3f（%.1fポイント）。\n\n",
+            b3$est, fmt_ci(b3$lo, b3$hi), fmt_p(b3$p), 2.8 * b3$se, 100 * 2.8 * b3$se))
+cat("信頼区間に0が含まれる場合は「この標本では差を検出できなかった」と書き、区間の上限・下限を「否定できる差の大きさ」として示す。\n")
+```
+
+# 統制変数の係数（主分析）
+
+```{r ctrl}
+lab <- c(dissat = "不満あり", `dissat:post_window` = "不満あり × 震災後の窓",
+         damage = "被害あり", damage_miss = "被害不明", log_inc = "log(1+年収)", inc_miss = "年収不明",
+         log_fin = "log(1+金融資産)", fin_miss = "金融資産不明", age = "年齢", age_miss = "年齢不明")
+ct <- as.data.frame(coeftable(mods[["主分析（統制あり）"]]))
+ci <- confint(mods[["主分析（統制あり）"]])
+tibble(変数 = unname(lab[rownames(ct)]), 係数 = sprintf("%.4f", ct[, 1]),
+       `95%信頼区間` = fmt_ci(ci[, 1], ci[, 2]), p値 = fmt_p(ct[, 4])) %>%
+  sh_kable(caption = "主分析の係数（固定効果：地域 × 調査年）")
+```
+
+# 研究課題3(a)：被害と加入の継続（補助）
+
+同じ式で、不満の代わりに被害の有無を比べます。不満は被害の後に測られた変数なので統制しません。被害ありで震災前に加入していた世帯は少ないため、信頼区間は広く、記述的な比較の補助として読みます。
+
+```{r damage}
+ctrl_a <- "log_inc + inc_miss + log_fin + fin_miss + age + age_miss"
+f_a <- as.formula(paste("eq_ins ~ damage + damage:post_window +", ctrl_a, "| region3^survey_year"))
+d_a  <- d_main %>% filter(!is.na(damage_any))
+d_ar <- d_rob  %>% filter(!is.na(damage_any))
+mods_a <- list("統制あり"                  = feols(f_a, d_a,  cluster = ~hh_id),
+               "頑健性（2016年まで）" = feols(f_a, d_ar, cluster = ~hh_id))
+res_a <- imap_dfr(mods_a, function(m, nm) {
+  d <- if (grepl("2016", nm)) d_ar else d_a
+  coef_rows(m, nm, a = "damage", b = "damage:post_window") %>%
+    mutate(係数 = sub("不満", "被害", 係数), 世帯数 = n_hh_used(m, d))
+})
+res_a %>%
+  transmute(推定, 係数, 推定値 = sprintf("%.3f", est),
+            `95%信頼区間` = fmt_ci(lo, hi), p値 = fmt_p(p),
+            観測数 = format(観測数, big.mark = ","), 世帯数 = format(世帯数, big.mark = ",")) %>%
+  sh_kable(caption = "被害あり − 被害なしの加入率の差（線形確率モデル、世帯でクラスタリング）")
+```
+
+# 研究課題3(c)：被害世帯の中での、補償への不満と加入の継続（記述）
+
+「被害を受ける → 補償（保険金）に不満を持つ → 地震保険をやめる」という流れを、被害世帯の中で記述します。上の (b) は全世帯で「何らかの不満」を比べたもので、この流れを直接確かめたものではありません。
+
+- **補償への不満**：GEES第2回 問2(3)の不満の内容のうち、「一部損壊・半壊時の保険金が少ない」「保険金の上限が少ない」「火災保険より保険金が低すぎる」のいずれか（`dissat_payout`）。不満なしの世帯は0。
+- **保険金の受け取り**：KHPS2012の「昨年1年間（2011年）の保険金の受け取り」（`payout_2011`）。生命保険・火災保険なども含み、地震保険だけの質問ではないため目安。GEESには地震保険の保険金の請求・受け取りの質問はない。
+- **時間の順序**：被害（2011年3月）→ 保険金の支払い（多くは2011年中）→ 不満の質問（2011年10月）→ 加入の追跡（2012年1月以降）。
+- 比較のため、被害なしの世帯で補償に不満がある世帯も並べる。被害なしの世帯の不満は自分の経験ではなく、制度への一般的な意見と考えられる。
+- **被害ありで震災前に加入していた世帯は少ない**ため、回帰で差を検出するのは難しい。記述にとどめ、信頼区間を付ける。共有用では、10世帯（観測）未満になるセルを伏せる。
+
+```{r rq3c-prep}
+rate_cell <- function(x) {
+  x <- x[!is.na(x)]; n <- length(x); k <- sum(x)
+  if (n == 0) return("")
+  if (SHARE && (n < MIN_CELL || (k > 0 & k < MIN_CELL) || (n - k > 0 & n - k < MIN_CELL))) return("—")
+  sprintf("%.3f", k / n)
+}
+grp_lv <- c("被害あり・補償に不満あり", "被害あり・補償に不満なし",
+            "被害なし・補償に不満あり", "被害なし・補償に不満なし")
+add_grp <- function(d) d %>%
+  filter(!is.na(damage_any), !is.na(dissat_payout)) %>%
+  mutate(群 = factor(paste0(if_else(damage_any == 1, "被害あり", "被害なし"), "・",
+                           if_else(dissat_payout == 1, "補償に不満あり", "補償に不満なし")),
+                    levels = grp_lv))
+c_all  <- add_grp(rq3 %>% filter(window %in% win_lv[1:2]))
+hh_c   <- c_all %>% filter(window == win_lv[2]) %>% distinct(hh_id, .keep_all = TRUE)
+```
+
+## 世帯数と、補償への不満・保険金の受け取り
+
+```{r rq3c-counts}
+cnt <- hh_c %>% count(群, .drop = FALSE) %>% rename(`世帯数（震災後の窓）` = n)
+kb_c <- sh_mask_counts(as.data.frame(cnt), "世帯数（震災後の窓）")   # 合計からの引き算で戻せないよう、2つ目も伏せる
+sh_kable(kb_c, caption = "震災前（2011年1月）に加入していた世帯：被害 × 補償への不満")
+
+hh_c %>% group_by(群) %>%
+  summarise(`2011年に保険金の受け取りあり（目安）` = rate_cell(payout_2011),
+            `何らかの不満あり` = rate_cell(dissat_any), .groups = "drop") %>%
+  sh_kable(caption = "群ごとの保険金の受け取り（KHPS2012、地震保険に限らない）と、何らかの不満の割合")
+
+hh_c %>% filter(damage_any == 1) %>%
+  summarise(`被害あり世帯` = sh_n(n()),
+            `一部損壊・半壊時の保険金が少ない` = rate_cell(dissat_partial_payout_low),
+            `保険金の上限が少ない` = rate_cell(dissat_cap_low),
+            `火災保険より保険金が低すぎる` = rate_cell(dissat_payout_lower_than_fire),
+            `保険料が高い` = rate_cell(dissat_premium)) %>%
+  sh_kable(caption = "被害あり世帯（震災前に加入）の不満の内容（割合、複数回答）")
+
+# 保険金の受け取り × 補償への不満（被害あり世帯）
+pc <- hh_c %>% filter(damage_any == 1, !is.na(payout_2011)) %>%
+  mutate(受け取り = if_else(payout_2011 == 1, "受け取りあり", "受け取りなし")) %>%
+  count(受け取り, 群) %>%
+  pivot_wider(names_from = 群, values_from = n, values_fill = 0)
+if (nrow(pc) > 0) {
+  sh_kable(sh_mask_counts(as.data.frame(pc), setdiff(names(pc), "受け取り")),
+           caption = "被害あり世帯：2011年の保険金の受け取り × 補償への不満（世帯数）")
+}
+```
+
+## 群ごとの、その後の加入率
+
+基準年に加入していた世帯の、その後の各年の加入率（追跡期間をまとめたもの）です。95%信頼区間は、群ごとの平均を世帯でクラスタリングした回帰から求めます。震災前の窓も並べるので、補償に不満のある被害世帯が、もともと加入をやめやすかったかも見られます。
+
+```{r rq3c-rates}
+grp_mean <- function(d) {
+  m <- feols(eq_ins ~ 0 + 群, d, cluster = ~hh_id)
+  ct <- as.data.frame(coeftable(m)); ci <- as.data.frame(confint(m))
+  tibble(群 = sub("^群", "", rownames(ct)), est = ct[, 1], lo = ci[, 1], hi = ci[, 2])
+}
+rate_tab <- map_dfr(win_lv[1:2], function(w) {
+  d <- c_all %>% filter(window == w)
+  stats <- d %>% group_by(群) %>%
+    summarise(hh = n_distinct(hh_id), n = n(), k = sum(eq_ins), .groups = "drop") %>%
+    mutate(群 = as.character(群))
+  grp_mean(d) %>% left_join(stats, by = "群") %>% mutate(窓 = w)
+}) %>%
+  mutate(hide = SHARE & (hh < MIN_CELL | n < MIN_CELL | (k > 0 & k < MIN_CELL) | (n - k > 0 & n - k < MIN_CELL)))
+
+rate_tab %>%
+  transmute(窓, 群,
+            世帯数 = sh_n(hh),
+            加入率 = if_else(hide, "—", sprintf("%.3f", est)),
+            `95%信頼区間` = if_else(hide, "—", fmt_ci(lo, hi))) %>%
+  sh_kable(caption = "群ごとの追跡期間の加入率（基準年に加入していた世帯）")
+```
+
+## 補償に不満あり − 不満なし（被害あり・被害なし別）
+
+被害あり世帯の中で、補償に不満のある世帯とない世帯の加入率の差を、震災前・震災後の窓で比べます。被害なし世帯でも同じものを示します。被害あり世帯は少ないので、信頼区間は非常に広くなります。
+
+```{r rq3c-diff}
+diff_rows <- map_dfr(c(1, 0), function(dm) {
+  d <- c_all %>% filter(damage_any == dm)
+  small <- d %>% group_by(window, dissat_payout) %>%
+    summarise(hh = n_distinct(hh_id), .groups = "drop")
+  too_small <- nrow(small) < 4 || any(small$hh < MIN_CELL)
+  lab <- if (dm == 1) "被害あり世帯" else "被害なし世帯"
+  # 上の表で伏せた群の加入率が、差と残りの群の加入率から引き算で戻せないよう、
+  # 対象の群のどれかを伏せていたら、差もすべて伏せる
+  grp_here <- if (dm == 1) grp_lv[1:2] else grp_lv[3:4]
+  too_small <- too_small || any(rate_tab$hide[rate_tab$群 %in% grp_here])
+  if (SHARE && too_small) {
+    return(tibble(対象 = lab, 係数 = c("震災前の窓での差", "震災後の窓での差", "差の変化"),
+                  推定値 = "—", `95%信頼区間` = "—", p値 = "—"))
+  }
+  # 被害あり世帯は少ないので、地域×年ではなく調査年の固定効果だけを入れる
+  m <- feols(eq_ins ~ dissat_payout + dissat_payout:post_window | survey_year, d, cluster = ~hh_id)
+  coef_rows(m, lab, a = "dissat_payout", b = "dissat_payout:post_window") %>%
+    transmute(対象 = lab,
+              係数 = recode(係数, "震災前の窓での差（b1）" = "震災前の窓での差",
+                            "震災後の窓での差（b1＋b3）" = "震災後の窓での差",
+                            "差の変化（b3）" = "差の変化"),
+              推定値 = sprintf("%.3f", est), `95%信頼区間` = fmt_ci(lo, hi), p値 = fmt_p(p))
+})
+sh_kable(diff_rows, caption = "補償に不満あり − 不満なしの加入率の差（統制なし、調査年の固定効果、世帯でクラスタリング）")
+```
+
+**読み方**：
+
+- 「被害→補償に不満→やめる」という流れがあれば、被害あり世帯で「震災後の窓での差」が負になり、震災前の窓より差が開く（差の変化が負）はずです。
+- 被害なし世帯で同じような差がなければ、補償への不満と加入の関係は、被害の経験と結び付いたものと考えられます。
+- 被害あり世帯は少ないため、差がある程度大きくても有意にならない可能性があります。点推定の向きと、信頼区間から否定できる大きさを記述します。第2段階（JHPSを加える）で被害世帯を増やせば、この分析が最も精度を上げられます。
+
+# 窓ごとの推定（読み取りの確認）
+
+上の交差項の式と同じ内容を、窓ごとに分けて推定したものです。統制変数の係数も窓ごとに変わるので、差の変化は上の b3 と少し異なりえます。
+
+```{r by-window}
+f_w <- as.formula(paste("eq_ins ~ dissat +", ctrl, "| region3^survey_year"))
+bw <- map_dfr(win_lv, function(w) {
+  d <- rq3 %>% filter(window == w)
+  m <- feols(f_w, d, cluster = ~hh_id)
+  tidy <- as.data.frame(coeftable(m))["dissat", ]
+  ci <- confint(m)["dissat", ]
+  tibble(窓 = w, `不満あり − 不満なし` = sprintf("%.3f", tidy[1, 1]),
+         `95%信頼区間` = fmt_ci(ci[1, 1], ci[1, 2]), p値 = fmt_p(tidy[1, 4]),
+         観測数 = format(nobs(m), big.mark = ","), 世帯数 = format(n_hh_used(m, d), big.mark = ","))
+})
+sh_kable(bw, caption = "窓ごとの不満あり − 不満なしの加入率の差（統制あり）")
+```
+
+# 保存
+
+```{r save}
+out <- bind_rows(res_main %>% mutate(比較 = "不満"), res_a %>% mutate(比較 = "被害"))
+readr::write_csv(out, file.path(params$out_dir, "rq3_coefficients.csv"))
+cat("係数を rq3_coefficients.csv に保存しました。\n")
+```
+
+```{r session, echo=FALSE}
+cat("R:", R.version.string, " fixest:", as.character(packageVersion("fixest")), "\n")
+```

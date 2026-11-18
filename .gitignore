@@ -1,0 +1,38 @@
+# --- 原則：コード以外は載せない ---
+# データ・前処理済みデータ・推定結果
+*.csv
+*.rds
+*.RData
+*.rda
+*.xlsx
+*.xls
+*.dta
+*.sav
+data/
+works/
+output/
+
+# Knit の出力・LaTeX の中間ファイル
+*.pdf
+*.html
+*.log
+*.aux
+*.tex
+*.toc
+*.out
+*_files/
+*_cache/
+
+# R・RStudio
+.Rhistory
+.Rproj.user/
+.RData
+
+# 秘密情報・環境設定
+.env
+.env.*
+
+# バックアップ・作業メモ
+*_backup_*
+*-1.Rmd
+_公開前チェックリスト.md

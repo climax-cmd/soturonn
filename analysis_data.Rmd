@@ -1,0 +1,554 @@
+---
+title: "分析用データの作成（研究課題1：イベントスタディ型DID・PSM）"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+documentclass: bxjsarticle
+classoption:
+  - xelatex
+  - ja=standard
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+params:
+  # khps_preprocess.Rmd が保存した前処理済みパネル（Docker 内のパス）
+  in_file: "/home/rstudio/works/output/khps_panel_2007_2018.rds"
+  # 分析用データの保存先（Claude outputs・Dropbox の外にすること）
+  out_dir: "/home/rstudio/works/output/analysis"
+  share_mode: false     # TRUE で共有用（小さいセルを伏せ、個別の確認表を出さない）
+  min_cell: 10          # 共有用で伏せる件数の閾値
+  show_code: false
+---
+
+<!--
+==============================================================================
+実行コマンド（RStudio のコンソールにそのまま貼る）
+Rmd は Dropbox の Claude outputs/khps_preprocess（コンテナ内 /home/rstudio/khps_preprocess）にある。
+
+Sys.setlocale("LC_CTYPE", "C.UTF-8")   # 「Character set is not UTF-8」の警告と文字化けを防ぐ
+setwd("/home/rstudio/khps_preprocess")  # この Rmd と share_utils.R があるフォルダ
+
+# 1) 自分用（確認用の表を含む。共有しない）
+rmarkdown::render("analysis_data.Rmd",
+                  output_dir = "/home/rstudio/works/output/reports",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = FALSE))
+
+# 2) 共有用（目で確認してから Claude outputs に移す）
+rmarkdown::render("analysis_data.Rmd",
+                  output_file = "analysis_data_share.pdf",
+                  output_dir = "/home/rstudio/works/share_check",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = TRUE, min_cell = 10))
+
+※ RStudio の Knit ボタンは Rmd と同じフォルダに PDF・.log・.tex を出すので使わない。
+※ 入力：khps_preprocess.Rmd の出力 khps_panel_2007_2018.rds
+※ 出力：out_dir に es_panel.rds / psm_base2011.rds / psm_placebo2007.rds
+==============================================================================
+-->
+
+```{r setup, include=FALSE}
+source("share_utils.R")
+SHARE    <- isTRUE(params$share_mode)
+MIN_CELL <- params$min_cell
+
+knitr::opts_chunk$set(echo = params$show_code, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 3.5)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(knitr)
+
+sh_check_dir(params$out_dir)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r banner, results='asis'}
+sh_banner()
+```
+
+# この文書について
+
+前処理済みパネル（`khps_panel_2007_2018.rds`）から、研究課題1の推定に使う3つのデータを作ります。推定そのものは別の Rmd で行います。
+
+| ファイル | 単位 | 用途 |
+|---|---|---|
+| `es_panel.rds` | 世帯×調査年（2007〜2018年） | イベントスタディ型DID（固定効果）。主分析は `in_main == 1`（2007〜2016年） |
+| `psm_base2011.rds` | 世帯（1行1世帯） | 傾向スコアの推定。共変量は2011年調査（震災前）の値 |
+| `psm_placebo2007.rds` | 世帯 | 同じPSMを震災前の窓（2007→2011年）に当てはめるプラセボ。共変量は2007年調査の値 |
+
+**事前に決めておく設定**（結果を見てから変えない）：基準年は2011年調査（k = −1、k = 調査年 − 2012）、主分析は k = −5〜+4、主な目的変数は地震保険加入（住居または家財）の1つ。
+
+```{r constants}
+REF_YEAR   <- 2011
+MAIN_YEARS <- 2007:2016
+ROB_YEARS  <- 2007:2018
+
+# PSM の共変量（第2段階と同じ指定にする。2011年＝震災前の値）
+# 年収、住宅の種類、年齢は指示どおり。保険料率は都道府県が必要なため、
+# 現時点では地域ブロック（東北・関東ダミー）で代用する（下の「都道府県の確認」を参照）。
+PSM_COVS <- c("log_inc", "log_fin", "age", "married", "hh_size", "mortgage",
+              "condo", "leasehold", "bldg_age", "big_city", "town", "tohoku", "kanto")
+```
+
+# 読み込み
+
+```{r load}
+panel <- readRDS(params$in_file)
+
+need <- c("hh_id", "survey_year", "cohort_ok", "base_owner", "base_region", "base_hh_inc",
+          "gees_w1", "gees_w2", "damage_any", "damage_house", "damage_contents",
+          "eq_ins", "eq_ins_bldg", "eq_ins_cont", "owner", "tenure", "region", "citysize",
+          "hh_inc_gross", "fin_assets", "age", "female", "married_d", "hh_size",
+          "mortgage_d", "bldg_age", "eq_w1", "eq_pre_w1", "eq_pre_w2", "eq_pre_2012")
+miss_cols <- setdiff(need, names(panel))
+if (length(miss_cols) > 0) {
+  stop("前処理済みデータに必要な列がありません: ", paste(miss_cols, collapse = ", "),
+       "\n khps_preprocess.Rmd を最新の版で実行し直してください。")
+}
+has_geo <- all(c("geo_CODE") %in% names(panel))
+```
+
+# 主分析標本の定義
+
+主分析標本は「2004・2007年コホートで、2011年調査に持家と回答し、GEES第1回に回答し、被害の有無が分かる世帯」です。処置は GEES第1回で住居または家財に被害あり（`damage_any`）。
+
+```{r sample-def}
+hh11 <- panel %>%
+  filter(survey_year == REF_YEAR, cohort_ok) %>%
+  distinct(hh_id, .keep_all = TRUE)
+
+flow <- tibble(
+  段階 = c("2011年調査に回答（2004・2007年コホート）",
+           "　うち2011年に持家",
+           "　うち GEES第1回に回答",
+           "　うち被害の有無が分かる（主分析標本）",
+           "　　被害あり",
+           "　　被害なし",
+           "（参考）主分析標本のうち KHPS2011 の地震保険加入が分かる"),
+  世帯数 = c(nrow(hh11),
+             sum(hh11$base_owner %in% 1),
+             sum(hh11$base_owner %in% 1 & hh11$gees_w1 %in% 1),
+             sum(hh11$base_owner %in% 1 & hh11$gees_w1 %in% 1 & !is.na(hh11$damage_any)),
+             sum(hh11$base_owner %in% 1 & hh11$gees_w1 %in% 1 & hh11$damage_any %in% 1),
+             sum(hh11$base_owner %in% 1 & hh11$gees_w1 %in% 1 & hh11$damage_any %in% 0),
+             sum(hh11$base_owner %in% 1 & hh11$gees_w1 %in% 1 & !is.na(hh11$damage_any) &
+                   !is.na(hh11$eq_ins))))
+
+base <- hh11 %>%
+  filter(base_owner %in% 1, gees_w1 %in% 1, !is.na(damage_any)) %>%
+  transmute(hh_id, treat = damage_any)
+base_ids <- base$hh_id
+
+flow %>% sh_mask_counts("世帯数", secondary = FALSE) %>%
+  sh_kable(caption = "標本の絞り込み（2011年調査時点の世帯数）")
+```
+
+# イベントスタディ用パネル（`es_panel`）
+
+## 作る変数
+
+- `k`：相対年（調査年 − 2012。2011年調査 = −1 が基準）
+- `ev_m5` 〜 `ev_p6`：`treat × 1(k = 値)`（k = −1 は作らない）。fixest の `i(k, treat, ref = -1)` を使う場合は不要ですが、他の方法でも推定できるように入れています。
+- `y_eq`：地震保険加入（主な目的変数）。2007〜2011年は持家の世帯に「あなたの世帯では地震保険に加入していますか」（住居・家財の区別なし）、2012年以降は住居または家財が「加入済」。
+- `y_eq_house`：頑健性(4)「住居」に限った定義。2011年以前は住居・家財の区別がないため `y_eq` と同じで、2012年以降だけ住居（`eq_ins_bldg`）。
+- `region_year`、`inc3_year`：頑健性(1)(2)の固定効果用（地域は2011年の地域ブロック、所得三分位は2011年調査の世帯年収で、主分析標本の中で分ける）。
+- `pre_mean_eq`：頑健性(3)用、2007〜2011年の加入の平均。
+- `kyushu`：九州除外版（2011年の地域ブロック = 九州）。
+
+統制変数は世帯FE＋年FEのみとし、時変の統制変数は入れません（年齢は世帯FEと年FEで完全に説明されるため入れられません。震災後の所得・資産・就業は処置の結果になりうるため入れません）。
+
+```{r es-panel}
+# 所得三分位（2011年調査の世帯年収＝2010年分。主分析標本内で分ける。不明は別区分）
+inc_q <- quantile(hh11$base_hh_inc[hh11$hh_id %in% base_ids], c(1/3, 2/3), na.rm = TRUE)
+base <- base %>%
+  left_join(hh11 %>% select(hh_id, base_hh_inc, base_region), by = "hh_id") %>%
+  mutate(inc3 = case_when(is.na(base_hh_inc) ~ "不明",
+                          base_hh_inc <= inc_q[1] ~ "低",
+                          base_hh_inc <= inc_q[2] ~ "中",
+                          TRUE ~ "高"),
+         kyushu = as.numeric(base_region %in% 8)) %>%
+  select(hh_id, treat, inc3, kyushu)
+
+ev_name <- function(k) paste0("ev_", if_else(k < 0, paste0("m", abs(k)), paste0("p", k)))
+k_all   <- setdiff((min(ROB_YEARS) - 2012):(max(ROB_YEARS) - 2012), -1)
+
+es <- panel %>%
+  filter(hh_id %in% base_ids, survey_year %in% ROB_YEARS) %>%
+  select(hh_id, survey_year, owner, eq_ins, eq_ins_bldg, eq_ins_cont, region, base_region,
+         any_of(c("cohort"))) %>%
+  left_join(base, by = "hh_id") %>%
+  mutate(k           = survey_year - 2012,
+         post        = as.numeric(survey_year >= 2012),
+         treat_post  = treat * post,
+         in_main     = as.numeric(survey_year %in% MAIN_YEARS),
+         y_eq        = eq_ins,
+         y_eq_house  = if_else(survey_year <= 2011, eq_ins, eq_ins_bldg),
+         region_year = paste(base_region, survey_year, sep = "_"),
+         inc3_year   = paste(inc3, survey_year, sep = "_"))
+
+for (kk in k_all) es[[ev_name(kk)]] <- es$treat * as.numeric(es$k == kk)
+
+# 世帯ごとの観測状況（主分析期間）。震災前・後の両方に y_eq がない世帯は、
+# 世帯FEのもとでは処置効果の識別に寄与しない。
+hh_obs <- es %>%
+  filter(in_main == 1) %>%
+  group_by(hh_id) %>%
+  summarise(n_eq_main   = sum(!is.na(y_eq)),
+            has_pre     = any(!is.na(y_eq) & k <= -1),
+            has_ref     = any(!is.na(y_eq) & k == -1),
+            has_post    = any(!is.na(y_eq) & k >= 0),
+            pre_mean_eq = if (any(!is.na(y_eq) & k <= -1)) mean(y_eq[k <= -1], na.rm = TRUE) else NA_real_,
+            # 主分析期間に回答した年はすべて持家（持家でなくなった世帯の頑健性チェック用）
+            always_owner = all(owner %in% 1),
+            .groups = "drop") %>%
+  mutate(ident_main = as.numeric(has_pre & has_post))
+
+es <- es %>% left_join(hh_obs, by = "hh_id") %>% arrange(hh_id, survey_year)
+```
+
+## 観測状況
+
+```{r es-obs}
+obs_tab <- hh_obs %>% left_join(base %>% select(hh_id, treat), by = "hh_id") %>%
+  mutate(群 = if_else(treat == 1, "被害あり", "被害なし")) %>%
+  group_by(群) %>%
+  summarise(世帯数 = n(),
+            `震災前に観測` = sum(has_pre),
+            `2011年に観測` = sum(has_ref),
+            `震災後に観測` = sum(has_post),
+            `前後とも観測` = sum(ident_main),
+            `ずっと持家` = sum(always_owner),
+            .groups = "drop")
+# 共有用：世帯数との差（観測のない世帯）が小さいセルも伏せる
+obs_tab %>%
+  mutate(across(c(`震災前に観測`, `2011年に観測`, `震災後に観測`, `前後とも観測`, `ずっと持家`),
+                ~ sh_n_compl(.x, 世帯数)),
+         世帯数 = sh_n(世帯数)) %>%
+  sh_kable(caption = "主分析標本の観測状況（2007〜2016年、y_eq の観測。「前後とも観測」の世帯が処置効果の識別に寄与する）")
+```
+
+## 群別の加入率の推移（生の平均）
+
+推定結果と並べて示す図の元になる表です。95%信頼区間は世帯の独立を仮定した正規近似で、記述用の目安です。
+
+```{r es-trend}
+mask_bin_mean <- function(m, n, k1) {
+  # 2値変数の平均は件数を逆算できるため、1 または 0 の件数が min_cell 未満なら伏せる
+  out <- sh_stat(m, n)
+  if (SHARE) out[k1 < MIN_CELL | (n - k1) < MIN_CELL] <- "—"
+  out
+}
+
+trend <- es %>%
+  filter(!is.na(y_eq)) %>%
+  group_by(survey_year, k, treat) %>%
+  summarise(n = n(), k1 = sum(y_eq == 1), p = mean(y_eq), .groups = "drop") %>%
+  mutate(se = sqrt(p * (1 - p) / n), lo = p - 1.96 * se, hi = p + 1.96 * se)
+
+trend %>%
+  mutate(群 = if_else(treat == 1, "被害あり", "被害なし"),
+         値 = paste0(mask_bin_mean(p, n, k1), "（n=", sh_n(n), "）")) %>%
+  select(調査年 = survey_year, k, 群, 値) %>%
+  pivot_wider(names_from = 群, values_from = 値) %>%
+  sh_kable(caption = "地震保険加入率（主分析標本、2018年まで。2011→2012年で質問形式が変わる）")
+```
+
+```{r es-trend-fig, fig.height=3.2}
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+  pd <- trend %>%
+    mutate(group = if_else(treat == 1, "Damaged", "Not damaged"),
+           show  = !SHARE | (n >= MIN_CELL & k1 >= MIN_CELL & (n - k1) >= MIN_CELL)) %>%
+    filter(show)
+  ggplot(pd, aes(survey_year, p, shape = group, linetype = group)) +
+    geom_vline(xintercept = 2011.5, linewidth = 0.3) +
+    geom_line() + geom_point() +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.15, linewidth = 0.3) +
+    scale_x_continuous(breaks = ROB_YEARS) +
+    labs(x = "Survey year (January)", y = "Earthquake insurance take-up",
+         shape = NULL, linetype = NULL) +
+    theme_minimal() + theme(legend.position = "bottom")
+}
+```
+
+# PSM 用データ（2011年基準：`psm_base2011`）
+
+共変量はすべて2011年調査（2011年1月、震災前）の値です。世帯年収は前年（2010年）分。妥当性の確認(1)用に、2012年調査（2011年分の年収）・2013年調査（2012年分）の年収も付けます。
+
+```{r cov-fn}
+# ある調査年の行から、同じ定義の共変量を作る（2011年基準とプラセボの2007年基準で共通）
+make_cov <- function(y) {
+  panel %>%
+    filter(survey_year == y, hh_id %in% base_ids) %>%
+    distinct(hh_id, .keep_all = TRUE) %>%
+    transmute(hh_id,
+              owner,
+              inc      = hh_inc_gross,
+              log_inc  = log1p(hh_inc_gross),
+              fin      = fin_assets,
+              log_fin  = log1p(pmax(fin_assets, 0)),
+              age, female,
+              married  = married_d,
+              hh_size,
+              mortgage = mortgage_d,
+              # 住居の所有関係（調査票 問3）：1 持家一戸建て（敷地自己所有）、2 持家マンション、
+              # 3・4 持家（一般借地・定期借地）。賃貸・不明は NA
+              detached  = case_when(tenure == 1 ~ 1, tenure %in% 2:4 ~ 0, TRUE ~ NA_real_),
+              condo     = case_when(tenure == 2 ~ 1, tenure %in% c(1, 3, 4) ~ 0, TRUE ~ NA_real_),
+              leasehold = case_when(tenure %in% 3:4 ~ 1, tenure %in% 1:2 ~ 0, TRUE ~ NA_real_),
+              bldg_age,
+              big_city = case_when(citysize == 1 ~ 1, citysize %in% 2:3 ~ 0, TRUE ~ NA_real_),
+              town     = case_when(citysize == 3 ~ 1, citysize %in% 1:2 ~ 0, TRUE ~ NA_real_),
+              region,
+              tohoku = as.numeric(region == 2),
+              kanto  = as.numeric(region == 3),
+              eq     = eq_ins)
+}
+
+# 欠測の扱い：PSM では欠測のある世帯が落ちて標本が減るため、
+# 中央値（2値は最頻値）で埋めた *_imp と、欠測を示す *_miss を作る。
+# 推定では *_imp と、欠測が一定数ある変数の *_miss を使う（どちらを使うかは推定前に決める）。
+impute_covs <- function(d, covs) {
+  for (v in covs) {
+    x <- d[[v]]
+    is_bin <- all(x[!is.na(x)] %in% c(0, 1))
+    fill <- if (is_bin) as.numeric(mean(x, na.rm = TRUE) >= 0.5) else median(x, na.rm = TRUE)
+    d[[paste0(v, "_miss")]] <- as.numeric(is.na(x))
+    d[[paste0(v, "_imp")]]  <- if_else(is.na(x), fill, x)
+  }
+  d
+}
+```
+
+```{r psm-base}
+inc_at <- function(y, nm) {
+  panel %>% filter(survey_year == y, hh_id %in% base_ids) %>%
+    distinct(hh_id, .keep_all = TRUE) %>%
+    transmute(hh_id, !!nm := hh_inc_gross)
+}
+eq_wide <- es %>%
+  select(hh_id, survey_year, y_eq) %>%
+  pivot_wider(names_from = survey_year, values_from = y_eq, names_prefix = "eq_")
+
+gees_vars <- panel %>%
+  filter(survey_year == REF_YEAR, hh_id %in% base_ids) %>%
+  distinct(hh_id, .keep_all = TRUE) %>%
+  select(hh_id, damage_house, damage_contents, any_of("damage_severe"),
+         eq_w1, eq_pre_w1, eq_pre_w2,
+         any_of(c("dissat_any", "dissat_payout", "dissat_premium", "victim_close", "gees_w2")),
+         any_of(grep("^geo_", names(panel), value = TRUE)))
+
+# 2012年調査の加入年月から見た震災前加入（2012年の行にだけ値がある）
+pre12 <- panel %>%
+  filter(survey_year == 2012, hh_id %in% base_ids) %>%
+  distinct(hh_id, .keep_all = TRUE) %>%
+  select(hh_id, eq_pre_2012)
+
+psm11 <- base %>%
+  left_join(make_cov(REF_YEAR) %>% select(-owner), by = "hh_id") %>%
+  impute_covs(PSM_COVS) %>%
+  left_join(inc_at(2012, "inc_s2012"), by = "hh_id") %>%
+  left_join(inc_at(2013, "inc_s2013"), by = "hh_id") %>%
+  mutate(
+    # 妥当性の確認(1)：被害で年収の変化に差がないか
+    #   s2012 は 2012年調査（2011年分＝震災前後が混在）、s2013 は 2013年調査（2012年分）
+    d_loginc_11_s12 = log1p(inc_s2012) - log_inc,
+    d_loginc_11_s13 = log1p(inc_s2013) - log_inc) %>%
+  left_join(eq_wide, by = "hh_id") %>%
+  left_join(gees_vars, by = "hh_id") %>%
+  left_join(pre12, by = "hh_id") %>%
+  left_join(hh_obs %>% select(hh_id, ident_main, pre_mean_eq, always_owner), by = "hh_id") %>%
+  # 研究課題1の補助：GEES第1回 問2(1) で震災前に未加入の世帯のうち「加入を考えた」
+  # （eq_w1 は gees_vars を結合した後でないと使えない）
+  mutate(intent_w1 = case_when(eq_w1 == 2 ~ 1, eq_w1 == 3 ~ 0, TRUE ~ NA_real_))
+
+if (has_geo) {
+  # GEES の CODE が5桁の市区町村コードなら、上2桁（÷1000）が都道府県コードになる（要確認）
+  psm11 <- psm11 %>% mutate(pref_from_code = geo_CODE %/% 1000,
+                            pref_from_code = if_else(pref_from_code %in% 1:47, pref_from_code, NA_real_))
+}
+```
+
+## バランス表（2011年の属性）
+
+マッチング前の比較です。標準化差（平均の差 ÷ 2群の分散の平均の平方根）の絶対値が0.1を超える変数は、群の間で偏りがあるとみなすのが一般的な目安です。
+
+```{r balance}
+bal_vars <- tribble(
+  ~var,        ~label,                          ~grp,
+  "inc",       "世帯年収（万円、2010年分）",     NA,
+  "log_inc",   "log(1+世帯年収)",               NA,
+  "fin",       "金融資産（万円）",               NA,
+  "age",       "対象者の年齢",                   NA,
+  "female",    "対象者が女性",                   NA,
+  "married",   "有配偶",                         NA,
+  "hh_size",   "同居人数",                       NA,
+  "mortgage",  "住宅ローンあり",                 NA,
+  "detached",  "持家一戸建て（敷地自己所有）",   "house",
+  "condo",     "持家マンション",                 "house",
+  "leasehold", "持家（借地）",                   "house",
+  "bldg_age",  "築年数",                         NA,
+  "big_city",  "政令市",                         "city",
+  "town",      "町村",                           "city",
+  "tohoku",    "東北",                           "region",
+  "kanto",     "関東",                           "region",
+  "eq",        "地震保険加入（KHPS2011）",       NA)
+
+# 共有用の判定：同じ区分（住宅の種類、都市規模、地域）の割合を並べると、
+# 残りの区分の件数が引き算で戻せる。区分のどれか（表にない「その他」を含む）が
+# min_cell 未満なら、その群の区分の行をまとめて伏せる。
+grp_ok <- function(d, arm, g) {
+  vs <- bal_vars$var[bal_vars$grp %in% g]
+  dd <- d[d$treat == arm, vs, drop = FALSE]
+  dd <- dd[stats::complete.cases(dd), , drop = FALSE]
+  cnt <- c(colSums(dd), rest = nrow(dd) - sum(colSums(dd)))
+  all(cnt == 0 | cnt >= MIN_CELL)
+}
+
+balance_tab <- function(d, vars) {
+  N1 <- sum(d$treat == 1); N0 <- sum(d$treat == 0)
+  map_dfr(seq_len(nrow(vars)), function(i) {
+    v  <- vars$var[i]
+    x1 <- d[[v]][d$treat == 1]; x1 <- x1[!is.na(x1)]
+    x0 <- d[[v]][d$treat == 0]; x0 <- x0[!is.na(x0)]
+    is_bin <- all(c(x1, x0) %in% c(0, 1))
+    m1 <- mean(x1); m0 <- mean(x0)
+    sdp <- sqrt((var(x1) + var(x0)) / 2)
+    ok1 <- !SHARE | (length(x1) >= MIN_CELL &
+                       (!is_bin | min(sum(x1), length(x1) - sum(x1)) >= MIN_CELL) &
+                       (is.na(vars$grp[i]) || grp_ok(d, 1, vars$grp[i])))
+    ok0 <- !SHARE | (length(x0) >= MIN_CELL &
+                       (!is_bin | min(sum(x0), length(x0) - sum(x0)) >= MIN_CELL) &
+                       (is.na(vars$grp[i]) || grp_ok(d, 0, vars$grp[i])))
+    tibble(変数 = vars$label[i],
+           `被害あり` = if (ok1) sprintf("%.3f", m1) else "—",
+           `n(あり)`  = sh_n_compl(length(x1), N1),
+           `被害なし` = if (ok0) sprintf("%.3f", m0) else "—",
+           `n(なし)`  = sh_n_compl(length(x0), N0),
+           `標準化差` = if (ok1 & ok0) sprintf("%.3f", (m1 - m0) / sdp) else "—")
+  })
+}
+balance_tab(psm11, bal_vars) %>%
+  sh_kable(caption = "被害あり・なしの2011年の属性（主分析標本、マッチング前、欠測を除く平均）")
+```
+
+## 共変量の欠測
+
+```{r missing}
+psm11 %>%
+  group_by(群 = if_else(treat == 1, "被害あり", "被害なし")) %>%
+  summarise(across(all_of(paste0(PSM_COVS, "_miss")), sum), 世帯数 = n(), .groups = "drop") %>%
+  pivot_longer(-c(群, 世帯数), names_to = "変数", values_to = "欠測") %>%
+  mutate(変数 = sub("_miss$", "", 変数)) %>%
+  select(-世帯数) %>%
+  pivot_wider(names_from = 群, values_from = 欠測) %>%
+  sh_mask_counts(c("被害あり", "被害なし"), secondary = FALSE) %>%
+  sh_kable(caption = "PSM 共変量の欠測の件数（*_imp では中央値・最頻値で埋め、*_miss で印を付けている）")
+```
+
+## 地域の分布
+
+```{r region}
+reg_lab <- c("1" = "北海道", "2" = "東北", "3" = "関東", "4" = "中部",
+             "5" = "近畿", "6" = "中国", "7" = "四国", "8" = "九州")
+if (SHARE) {
+  cat("（共有用PDFでは、地域ブロック別の件数は表示していません。被害あり世帯の地域の偏りは、上のバランス表の標準化差で判断してください。）\n")
+} else {
+  psm11 %>%
+    mutate(地域 = coalesce(unname(reg_lab[as.character(region)]), "不明"),
+           群 = if_else(treat == 1, "被害あり", "被害なし")) %>%
+    count(地域, 群) %>%
+    pivot_wider(names_from = 群, values_from = n, values_fill = 0) %>%
+    sh_kable(caption = "地域ブロック")
+}
+```
+
+## 都道府県の確認（保険料率をつなぐための準備）
+
+PSM のマッチング変数にする地震保険の基本料率は都道府県・構造別に決まります。KHPS 本体には地域ブロックしかないため、GEES第1回の地理情報 `CODE`（FMT では定義の記載なし）が市区町村コードであれば、上2桁から都道府県が分かります。ここでは、それが成り立っているかを集計だけで確かめます。
+
+```{r pref-check}
+if (has_geo) {
+  # 都道府県コード → KHPS の地域ブロック（想定。新潟・山梨・三重などの扱いは KHPS の定義を要確認）
+  pref_block <- c(1, rep(2, 6), rep(3, 7), rep(4, 9), rep(5, 7), rep(6, 5), rep(7, 4), rep(8, 8))
+  pc <- psm11 %>%
+    mutate(block_from_code = pref_block[pref_from_code],
+           agree = block_from_code == region)
+  tibble(項目 = c("主分析標本の世帯数",
+                  "CODE がある世帯",
+                  "CODE ÷ 1000 が 1〜47（都道府県コードとして読める）",
+                  "　うち、そこから決めた地域ブロックが KHPS の地域ブロックと一致",
+                  "読み取れた都道府県の数"),
+         値 = c(nrow(pc), sum(!is.na(pc$geo_CODE)), sum(!is.na(pc$pref_from_code)),
+               sum(pc$agree %in% TRUE), n_distinct(pc$pref_from_code, na.rm = TRUE))) %>%
+    mutate(値 = if_else(row_number() == 5, as.character(値), sh_n(値))) %>%
+    sh_kable(caption = "GEES の CODE から都道府県が分かるか（一致が9割以上なら市区町村コードとみてよい）")
+} else {
+  cat("前処理済みデータに GEES の地理情報（geo_CODE）がありません。\n")
+}
+```
+
+**読み方**：一致の割合がほぼ100%（ブロックの境界の県だけずれる程度）なら、`pref_from_code` に都道府県・構造別の料率表（自分で作る CSV）をつなげば、指示どおりの「震災前の料率水準」と「その後の変化」をマッチング変数にできます。構造（イ構造＝主に非木造／ロ構造＝主に木造）は KHPS では直接分からないため、マンション＝非木造とみなすなどの仮定が必要です。
+
+# プラセボ用データ（2007年基準：`psm_placebo2007`）
+
+震災前の窓（2007→2011年）に、2011年基準と同じ定義の共変量（2007年調査の値）で同じPSMを当てはめます。処置は同じ「将来の被害（GEES第1回）」なので、マッチング後に 2007→2011年の加入の変化に差があれば、PSM で調整しきれない差がもともとあったことを示します。2007年に持家で、2007年と2011年の加入が両方分かる世帯が対象です。
+
+```{r placebo}
+cov07 <- make_cov(2007)
+psm07 <- base %>%
+  inner_join(cov07, by = "hh_id") %>%
+  filter(owner %in% 1) %>%
+  select(-owner) %>%
+  impute_covs(PSM_COVS) %>%
+  left_join(eq_wide %>% select(hh_id, eq_2007, eq_2011), by = "hh_id") %>%
+  mutate(d_eq_07_11 = eq_2011 - eq_2007)
+
+tibble(群 = c("被害あり", "被害なし"),
+       `2007年に持家` = c(sum(psm07$treat == 1), sum(psm07$treat == 0)),
+       `2007・2011年の加入が両方分かる` = c(sum(psm07$treat == 1 & !is.na(psm07$d_eq_07_11)),
+                                           sum(psm07$treat == 0 & !is.na(psm07$d_eq_07_11)))) %>%
+  sh_mask_counts(c("2007年に持家", "2007・2011年の加入が両方分かる"), secondary = FALSE) %>%
+  sh_kable(caption = "プラセボ用データの世帯数")
+```
+
+# 保存
+
+```{r save}
+saveRDS(es,    file.path(params$out_dir, "es_panel.rds"))
+saveRDS(psm11, file.path(params$out_dir, "psm_base2011.rds"))
+saveRDS(psm07, file.path(params$out_dir, "psm_placebo2007.rds"))
+
+tibble(ファイル = c("es_panel.rds", "psm_base2011.rds", "psm_placebo2007.rds"),
+       単位 = c("世帯×調査年", "世帯", "世帯"),
+       行数 = sh_n(c(nrow(es), nrow(psm11), nrow(psm07))),
+       うち主分析期間 = c(sh_n(sum(es$in_main == 1)), "", "")) %>%
+  sh_kable(caption = if (SHARE) "保存したファイル" else paste0("保存先：", normalizePath(params$out_dir)))
+```
+
+# 作成した主な変数
+
+| データ | 変数 | 内容 |
+|---|---|---|
+| es_panel | `treat` | GEES第1回で住居または家財に被害あり（1）／なし（0） |
+| | `k`, `post`, `treat_post` | 相対年（2011年調査 = −1）、震災後（2012年調査以降）、treat × post |
+| | `ev_m5`〜`ev_p6` | treat × 1(k = 値)。k = −1 は基準のため作らない |
+| | `y_eq`, `y_eq_house` | 地震保険加入（主）、住居に限った定義（頑健性） |
+| | `in_main` | 主分析期間（2007〜2016年調査） |
+| | `region_year`, `inc3_year`, `kyushu` | 地域×年FE用、所得三分位×年FE用、九州（2011年の地域） |
+| | `pre_mean_eq`, `ident_main`, `always_owner` | 2007〜2011年の加入の平均、前後とも観測あり、期間中ずっと持家 |
+| psm_base2011 | `log_inc` など（`PSM_COVS`） | 2011年調査の共変量。`*_imp` は欠測を埋めた値、`*_miss` は欠測の印 |
+| | `eq_2007`〜`eq_2018` | 各年の地震保険加入（横持ち） |
+| | `d_loginc_11_s12`, `d_loginc_11_s13` | 年収の変化（妥当性の確認(1)） |
+| | `intent_w1` | GEES第1回で震災前未加入のうち「加入を考えた」 |
+| | `pref_from_code` | GEES の CODE から読んだ都道府県コード（定義は要確認） |
+| psm_placebo2007 | 同じ共変量（2007年の値）、`d_eq_07_11` | プラセボの目的変数：2007→2011年の加入の変化 |
+
+```{r session, echo=FALSE}
+cat("R:", R.version.string, "\n")
+```

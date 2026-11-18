@@ -1,0 +1,282 @@
+---
+title: "研究課題3の分析用データ：震災前加入世帯の加入の非継続と、不満・被害"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+documentclass: bxjsarticle
+classoption:
+  - xelatex
+  - ja=standard
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+params:
+  # khps_preprocess.Rmd が保存した前処理済みパネル（Docker 内のパス）
+  in_file: "/home/rstudio/works/output/khps_panel_2007_2018.rds"
+  # 分析用データの保存先（Claude outputs・Dropbox の外にすること）
+  out_dir: "/home/rstudio/works/output/analysis"
+  share_mode: false     # TRUE で共有用（小さいセルを伏せる）
+  min_cell: 10          # 共有用で伏せる件数の閾値
+  show_code: false
+---
+
+<!--
+==============================================================================
+実行コマンド（RStudio のコンソールにそのまま貼る）
+Rmd は Dropbox の Claude outputs/khps_preprocess（コンテナ内 /home/rstudio/khps_preprocess）にある。
+
+Sys.setlocale("LC_CTYPE", "C.UTF-8")
+setwd("/home/rstudio/khps_preprocess")
+
+# 1) 自分用（共有しない）
+rmarkdown::render("rq3_data.Rmd",
+                  output_dir = "/home/rstudio/works/output/reports",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = FALSE))
+
+# 2) 共有用（目で確認してから Claude outputs に移す）
+rmarkdown::render("rq3_data.Rmd",
+                  output_file = "rq3_data_share.pdf",
+                  output_dir = "/home/rstudio/works/share_check",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = TRUE, min_cell = 10))
+
+※ RStudio の Knit ボタンは使わない（Rmd と同じフォルダに PDF・.log ができるため）。
+※ 入力：khps_preprocess.Rmd の出力 khps_panel_2007_2018.rds（11/5版）
+※ 出力：out_dir に rq3_windows.rds（世帯 × 窓。推定用）
+==============================================================================
+-->
+
+```{r setup, include=FALSE}
+source("share_utils.R")
+SHARE    <- isTRUE(params$share_mode)
+MIN_CELL <- params$min_cell
+
+knitr::opts_chunk$set(echo = params$show_code, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 3.5)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+
+sh_check_dir(params$out_dir)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 0/1 の割合。共有用では、該当・非該当のどちらかの件数が min_cell 未満なら伏せる
+rate_cell <- function(x) {
+  x <- x[!is.na(x)]; n <- length(x); k <- sum(x)
+  if (n == 0) return("")
+  if (SHARE && (n < MIN_CELL || (k > 0 & k < MIN_CELL) || (n - k > 0 & n - k < MIN_CELL))) return("—")
+  sprintf("%.3f", k / n)
+}
+```
+
+```{r banner, results='asis'}
+sh_banner()
+```
+
+# この文書について
+
+研究課題3（震災前に加入していた世帯での、加入の継続と、被害・不満との関連）の分析用データを作り、推定の前に件数を確かめます。推定は別の Rmd で行います。
+
+**事前に決めた設計**（11月5〜6日、結果を見る前に決めたもの）
+
+| 項目 | 内容 |
+|---|---|
+| 標本 | 2011年に持家、GEES第2回に回答し、不満の質問（問2(3)）に回答した世帯 |
+| 比べる群 | 主に不満の有無（`dissat_any`）。不満の内容（支払額系 `dissat_payout`・保険料 `dissat_premium`）は記述にとどめる。被害の有無（`damage_any`）でも比べる（研究課題3(a)） |
+| 窓 | 震災後の窓：2011年調査で加入 → 2012〜2015年調査。震災前の窓：2007年調査で加入 → 2008〜2011年調査（どちらも4年）。震災後の窓を2016年までにしたものは頑健性 |
+| 目的変数 | 追跡する各調査年の地震保険加入（1＝加入、0＝非加入）を**そのまま**使う。観測単位は世帯 × 窓 × 追跡する調査年。「2年続けて非加入」のような加工はしない（指導教員との相談、11/6） |
+| 脱落の扱い | 回答のない年は観測がないだけとして扱い、加工しない。年ごとの観測数は記述として示す |
+
+**注意**：
+
+- 不満は2011年10月に聞いているので、震災前の窓の世帯は全員が2011年まで回答している。一方、震災後の窓では途中で調査から抜ける世帯があり、後の年ほど観測数が減る。
+- 自己申告の加入には年1割強の回答のぶれがあり、それも非加入として入る。不満あり・なしでぶれ方が同じなら、群の差には影響しない。
+
+**地震保険加入の定義**（前処理と同じ）：2011年以前は持家の世帯への「世帯で地震保険に加入しているか」、2012年以降は住居または家財のどちらかに加入。2012年に質問の形式が変わるため、震災後の窓では見かけ上の非継続が出うる（群の差をとれば、形式の影響が両群で同じ限り打ち消される）。
+
+# データの読み込み
+
+```{r load}
+panel <- readRDS(params$in_file)
+need <- c("hh_id", "survey_year", "cohort_ok", "eq_ins", "base_owner", "base_eq_ins",
+          "gees_w2", "dissat_any", "dissat_payout", "dissat_premium", "damage_any",
+          "base_region", "base_hh_inc", "base_fin_assets", "base_age", "ins_payout_d",
+          "dissat_partial_payout_low", "dissat_cap_low", "dissat_payout_lower_than_fire")
+miss_cols <- setdiff(need, names(panel))
+if (length(miss_cols) > 0) stop("前処理済みパネルに次の列がありません: ", paste(miss_cols, collapse = ", "))
+
+# 世帯ごとの値（2011年調査の行から）
+hh11 <- panel %>%
+  filter(survey_year == 2011, cohort_ok) %>%
+  distinct(hh_id, .keep_all = TRUE) %>%
+  transmute(hh_id, base_owner, base_eq_ins, gees_w2, damage_any,
+            dissat_any, dissat_payout, dissat_premium,
+            dissat_partial_payout_low, dissat_cap_low, dissat_payout_lower_than_fire,
+            region3 = case_when(base_region == 2 ~ "東北", base_region == 3 ~ "関東",
+                                !is.na(base_region) ~ "その他"),
+            base_hh_inc, base_fin_assets, base_age)
+
+# 2012年調査の「昨年1年間（2011年）の保険金の受け取り（生命保険・火災保険など）」。
+# 地震保険だけの質問ではないが、被害世帯では地震保険の保険金を含む可能性が高い（研究課題3(c)の目安）
+payout11 <- panel %>% filter(survey_year == 2012) %>%
+  distinct(hh_id, .keep_all = TRUE) %>%
+  transmute(hh_id, payout_2011 = ins_payout_d)
+hh11 <- hh11 %>% left_join(payout11, by = "hh_id")
+
+# 世帯 × 年の加入（2007〜2016年）
+eq_long <- panel %>%
+  filter(cohort_ok, survey_year %in% 2007:2016) %>%
+  distinct(hh_id, survey_year, .keep_all = TRUE) %>%
+  select(hh_id, survey_year, eq_ins)
+rm(panel)
+```
+
+# 窓ごとのデータの作成
+
+```{r windows}
+# base_y：基準の調査年、follow：追跡する調査年。基準年の加入と、追跡する年の加入をそのまま縦に並べる
+make_window <- function(base_y, follow, label) {
+  base <- eq_long %>% filter(survey_year == base_y) %>% select(hh_id, base_ins = eq_ins)
+  eq_long %>%
+    filter(survey_year %in% follow, !is.na(eq_ins)) %>%
+    inner_join(base, by = "hh_id") %>%
+    mutate(window = label, rel = survey_year - base_y)    # rel：基準年から何年後か（1〜4、頑健性は5まで）
+}
+
+win_lv <- c("震災前（2007→2008〜11年）", "震災後（2011→2012〜15年）", "震災後・頑健性（2011→2012〜16年）")
+win_all <- bind_rows(
+  make_window(2007, 2008:2011, win_lv[1]),
+  make_window(2011, 2012:2015, win_lv[2]),
+  make_window(2011, 2012:2016, win_lv[3]))
+
+base_sample <- hh11 %>% filter(base_owner %in% 1, gees_w2 %in% 1, !is.na(dissat_any))
+
+rq3 <- win_all %>%
+  inner_join(base_sample, by = "hh_id") %>%
+  filter(base_ins %in% 1) %>%
+  mutate(window = factor(window, levels = win_lv),
+         post_window = as.numeric(window != win_lv[1]),
+         不満 = if_else(dissat_any == 1, "不満あり", "不満なし"),
+         被害 = case_when(damage_any == 1 ~ "被害あり", damage_any == 0 ~ "被害なし", TRUE ~ "被害不明"))
+
+saveRDS(rq3, file.path(params$out_dir, "rq3_windows.rds"))
+```
+
+# 標本の絞り込み
+
+```{r flow}
+n_hh <- function(d) n_distinct(d$hh_id)
+base_in <- function(y) eq_long %>% filter(survey_year == y, eq_ins %in% 1) %>% distinct(hh_id)
+s1 <- hh11
+s2 <- s1 %>% filter(base_owner %in% 1)
+s3 <- s2 %>% filter(gees_w2 %in% 1)
+s4 <- s3 %>% filter(!is.na(dissat_any))
+s5 <- s4 %>% semi_join(base_in(2011), by = "hh_id")
+s6 <- s5 %>% semi_join(filter(rq3, window == win_lv[2]), by = "hh_id")
+s7 <- s4 %>% semi_join(base_in(2007), by = "hh_id")
+s8 <- s7 %>% semi_join(filter(rq3, window == win_lv[1]), by = "hh_id")
+
+flow <- tibble(
+  段階 = c("2011年調査に回答（2004・2007年コホート）", "うち2011年に持家", "うちGEES第2回に回答",
+           "うち不満の質問に回答", "震災後の窓：うちKHPS2011で加入", "　うち2012〜15年に1年以上観測",
+           "震災前の窓：うちKHPS2007で加入", "　うち2008〜11年に1年以上観測"),
+  世帯数 = c(n_hh(s1), n_hh(s2), n_hh(s3), n_hh(s4), n_hh(s5), n_hh(s6), n_hh(s7), n_hh(s8)))
+sh_kable(sh_mask_counts(as.data.frame(flow), "世帯数", secondary = FALSE),
+         caption = "研究課題3の標本の絞り込み（世帯数）")
+```
+
+# 群ごとの加入の推移
+
+基準年に加入していた世帯のうち、その後の各年に加入と答えた割合です（観測された回答そのまま）。1から引いた値が、その年に非加入と答えた割合です。
+
+```{r by-group}
+tab_by <- function(d, grp) {
+  long <- d %>% group_by(窓 = window, 群 = .data[[grp]], 年後 = rel) %>%
+    summarise(n = n(), v = rate_cell(eq_ins), .groups = "drop")
+  rates <- long %>% select(-n) %>%
+    pivot_wider(names_from = 年後, values_from = v, names_prefix = "加入率：") %>%
+    mutate(across(-c(窓, 群), ~ coalesce(.x, "")))     # 5年後は頑健性の窓だけ
+  ns <- long %>% select(-v) %>% mutate(n = sh_n(n)) %>%
+    pivot_wider(names_from = 年後, values_from = n, names_prefix = "観測数：") %>%
+    mutate(across(-c(窓, 群), ~ coalesce(.x, "")))
+  list(rates = rates, ns = ns)
+}
+t_d <- tab_by(rq3, "不満")
+sh_kable(t_d$rates, caption = "不満の有無別：基準年に加入していた世帯の、その後の各年の加入率（列は基準年から何年後か）")
+sh_kable(t_d$ns,    caption = "上の表の観測数（世帯 × 年）")
+
+t_h <- tab_by(rq3 %>% filter(被害 != "被害不明"), "被害")
+sh_kable(t_h$rates, caption = "被害の有無別：その後の各年の加入率（研究課題3(a)）")
+sh_kable(t_h$ns,    caption = "上の表の観測数（世帯 × 年）")
+
+# 窓全体の平均（追跡する年の観測をすべてまとめたもの）
+rq3 %>% group_by(窓 = window, 群 = 不満) %>%
+  summarise(`世帯数` = sh_n(n_distinct(hh_id)), `観測数` = sh_n(n()),
+            `追跡期間の加入率` = rate_cell(eq_ins), .groups = "drop") %>%
+  sh_kable(caption = "不満の有無別：追跡期間をまとめた加入率")
+```
+
+**読み方**：震災前の窓で不満あり・なしの加入率に差があれば、不満のある世帯はもともとやめやすかった（または回答がぶれやすかった）ことになります。震災後の窓での差から震災前の窓での差を引いたものが、推定で見る量の目安です。
+
+# 不満と被害の重なり
+
+```{r cross}
+# 被害不明の世帯は少数で、伏せると被害ありの列まで伏せられるので除く
+# rq3 は世帯 × 年なので、世帯単位にしてから数える
+hh_post <- rq3 %>% filter(window == win_lv[2]) %>% distinct(hh_id, .keep_all = TRUE)
+cr <- hh_post %>% filter(被害 != "被害不明") %>%
+  count(不満, 被害) %>%
+  pivot_wider(names_from = 被害, values_from = n, values_fill = 0)
+sh_kable(sh_mask_counts(as.data.frame(cr), setdiff(names(cr), "不満")),
+         caption = "震災後の窓の世帯：不満の有無 × 被害の有無（世帯数、被害不明を除く）")
+
+# 不満の内容（不満ありの世帯のうち）
+hh_post %>% filter(dissat_any == 1) %>%
+  summarise(`不満ありの世帯数` = sh_n(n()),
+            `支払額系の不満（選択肢3〜5のいずれか）` = rate_cell(dissat_payout),
+            `保険料が高い` = rate_cell(dissat_premium)) %>%
+  sh_kable(caption = "震災後の窓の不満あり世帯：不満の内容（割合、複数回答）")
+```
+
+# 震災前の属性（不満の有無別）
+
+不満の有無で、震災前の属性にどれだけ違いがあるかを確かめます（推定で統制するかどうかの判断材料）。
+
+```{r balance}
+hh_post %>%
+  group_by(不満) %>%
+  summarise(世帯数 = sh_n(n()),
+            `年齢（平均）` = sprintf("%.1f", mean(base_age, na.rm = TRUE)),
+            `世帯年収（平均、万円）` = sprintf("%.0f", mean(base_hh_inc, na.rm = TRUE)),
+            `金融資産（平均、万円）` = sprintf("%.0f", mean(base_fin_assets, na.rm = TRUE)),
+            `被害あり` = rate_cell(as.numeric(damage_any == 1)),
+            `関東` = rate_cell(as.numeric(region3 == "関東")),
+            `東北` = rate_cell(as.numeric(region3 == "東北")),
+            .groups = "drop") %>%
+  sh_kable(caption = "震災後の窓の世帯：不満の有無別の2011年の属性")
+```
+
+# 保存
+
+```{r save}
+tibble(ファイル = "rq3_windows.rds",
+       内容 = "世帯 × 窓 × 追跡する調査年。基準年に加入していた世帯のみ",
+       行数 = sh_n(nrow(rq3))) %>%
+  sh_kable(caption = paste0("保存先：", normalizePath(params$out_dir)))
+```
+
+| 変数 | 内容 |
+|---|---|
+| `window`, `post_window` | 窓の名前、震災後の窓なら1 |
+| `survey_year`, `rel` | 追跡する調査年、基準年から何年後か |
+| `eq_ins` | その年の地震保険加入（目的変数。観測された回答そのまま） |
+| `dissat_any`, `dissat_payout`, `dissat_premium` | GEES第2回の不満（何らかの不満、支払額系、保険料） |
+| `damage_any` | GEES第1回の被害 |
+| `region3`, `base_hh_inc`, `base_fin_assets`, `base_age` | 2011年の地域（3区分）・年収・金融資産・年齢 |
+| `dissat_partial_payout_low`, `dissat_cap_low`, `dissat_payout_lower_than_fire` | 補償への不満の内容：一部損壊・半壊時の保険金が少ない、保険金の上限が少ない、火災保険より保険金が低すぎる |
+| `payout_2011` | 2012年調査で答えた、2011年中の保険金の受け取り（生命保険・火災保険など。地震保険に限らない） |

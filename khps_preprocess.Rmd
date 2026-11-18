@@ -1,0 +1,1188 @@
+---
+title: "KHPS 前処理レポート（2007〜2018年調査、GEES接続、2004年調査の学歴）"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+documentclass: bxjsarticle
+classoption:
+  - xelatex
+  - ja=standard
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+params:
+  # ※ RStudio は Docker コンテナ内で動くため、Windows のパス（C:/...）は使えません。
+  #   ホスト側の works フォルダが、コンテナ内では /home/rstudio/works になります。
+  data_dir: "/home/rstudio/works/KHPS_GEES_data"            # KHPS・GEES の CSV を置いたフォルダ（サブフォルダも検索します）
+  map_dir: "."                                      # 対応表CSV（khps_var_map.csv など）を置いたフォルダ。"." は Rmd と同じフォルダ
+  out_dir: "/home/rstudio/works/output"             # 前処理済みデータの保存先
+  csv_encoding: "CP932"                             # 文字化けする場合は "UTF-8" に変更
+  use_gees: true                                    # GEES（震災特別調査）を接続するか
+  gees_dir: ""                                      # 空欄なら data_dir を検索
+  gees_has_header: false                            # GEESのCSVの1行目が変数名なら true
+  show_code: false                                  # PDFにコードも表示するなら true
+  share_mode: false                                 # TRUE で共有用（小さいセルを伏せ、ID・範囲チェック・整合性の表を出さない）
+  min_cell: 10                                      # 共有用で伏せる件数の閾値
+---
+
+<!--
+==============================================================================
+実行コマンド（RStudio のコンソールにそのまま貼る）
+Rmd は Dropbox の Claude outputs/khps_preprocess（コンテナ内 /home/rstudio/khps_preprocess）にある。
+
+Sys.setlocale("LC_CTYPE", "C.UTF-8")   # 「Character set is not UTF-8」の警告と文字化けを防ぐ
+setwd("/home/rstudio/khps_preprocess")  # この Rmd・share_utils.R・対応表CSVがあるフォルダ
+
+# 1) 自分用（ID・範囲チェック・整合性の表を含む。共有しない）
+rmarkdown::render("khps_preprocess.Rmd",
+                  output_dir = "/home/rstudio/works/output/reports",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = FALSE))
+
+# 2) 共有用（目で確認してから Claude outputs に移す）
+rmarkdown::render("khps_preprocess.Rmd",
+                  output_file = "khps_preprocess_share.pdf",
+                  output_dir = "/home/rstudio/works/share_check",
+                  intermediates_dir = tempdir(),
+                  params = list(share_mode = TRUE, min_cell = 10))
+
+※ RStudio の Knit ボタンは Rmd と同じフォルダ（Claude outputs）に PDF・.log・.tex を出すので使わない。
+※ 入力：data_dir の KHPS 各年 CSV（2004年調査は学歴だけを取り出す）と GEES の CSV
+※ 出力：out_dir に khps_panel_2007_2018.rds / .csv、khps_main_2007_2016.rds、
+         audit_by_variable.csv、gt_check.csv
+※ どちらのモードでも同じデータを作り直して保存する（中身は同じ）。
+==============================================================================
+-->
+
+```{r setup, include=FALSE}
+source("share_utils.R")
+SHARE    <- isTRUE(params$share_mode)
+MIN_CELL <- params$min_cell
+
+knitr::opts_chunk$set(echo = params$show_code, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 3.5)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(purrr)
+library(stringr)
+library(knitr)
+
+# 表の出力は share_utils.R の sh_kable を使う（表題の _ % & # をエスケープ）
+kb <- function(x, caption = NULL, digits = 3) sh_kable(x, caption = caption, digits = digits)
+
+# 件数の列を伏せてから表にする（share_mode でなければそのまま）
+kb_n <- function(x, count_cols, caption = NULL, digits = 3) {
+  kb(sh_mask_counts(as.data.frame(x), count_cols), caption = caption, digits = digits)
+}
+
+sh_check_dir(params$out_dir)   # Claude outputs・Dropbox の中に書き出さない
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# p値の表示：0.001 未満は「<0.001」と表示する（丸めて 0.000 と出るのを避ける）
+fmt_p <- function(p) format.pval(p, digits = 3, eps = 0.001)
+
+# クロス表を見やすい表にする（行名が X0・NA. のようになるのを避け、欠損は「欠損」と表示）
+xt <- function(tab, row_title) {
+  r <- dimnames(tab)[[1]]; cl <- dimnames(tab)[[2]]
+  r[is.na(r)] <- "欠損"; cl[is.na(cl)] <- "欠損"
+  out <- as.data.frame(matrix(as.integer(tab), nrow = length(r)))
+  names(out) <- cl
+  cbind(setNames(data.frame(r, stringsAsFactors = FALSE), row_title), out)
+}
+# 0/1 変数の割合。共有用では、該当（1）・非該当（0）のどちらかの件数が min_cell 未満なら NA にする
+# （割合と分母が分かると件数が戻せるため。0件のときは伏せない）
+sh_prop <- function(x) {
+  v <- x[!is.na(x)]; n <- length(v); k <- sum(v == 1)
+  if (n == 0) return(NA_real_)
+  if (SHARE && (n < MIN_CELL || (k > 0 & k < MIN_CELL) || (n - k > 0 & n - k < MIN_CELL))) return(NA_real_)
+  k / n
+}
+# クロス表を表にする（共有用では小さいセルを伏せる）
+kb_xt <- function(tab, row_title, caption = NULL) {
+  d <- xt(tab, row_title)
+  kb_n(d, names(d)[-1], caption = caption)
+}
+```
+
+```{r banner, results='asis'}
+sh_banner()
+```
+
+# この文書について
+
+- KHPS の各年 CSV（1行目からデータ、変数名なし）を読み込み、**codebook の変数番号＝CSV の列番号**として必要な列だけを取り出し、世帯（対象者）ID で年をつないだパネルを作ります。
+- 列番号・無回答コード・非該当コードはすべて `khps_var_map.csv` で管理しています。番号を直したいときは、このコードではなく CSV を編集してください。
+- 主分析の期間は 2007〜2016 年調査（2011 年調査が震災前最後）、頑健性用に 2017・2018 年も読み込みます。2012 年新規コホートは震災前のデータがないため、読み込まず分析対象から外します。
+- 2018 年の列番号は codebook がフォルダになかったため時系列ファイルから作成しました（未照合）。下の「範囲チェック」で異常がないか必ず確認してください。
+- 2004 年調査は、**2004年コホートの最終学歴を取り出すためだけ**に読み込みます（学歴はパネルに入った年にしか聞かないため）。2004年の行はパネルに入れず、学歴を世帯ごとの固定値として全年に付けます。2007年コホートの学歴は2007年新規調査から取ります。
+- 危険回避度は、2009年調査の「降水確率が何%以上なら傘を持って出かけるか」（震災前で唯一の年）を、世帯ごとの固定値として全年に付けます。
+- `share_mode = TRUE` のときは、ID の照合・付け替え、範囲チェック、パネル整合性の表を出さず、件数が `min_cell` 未満のセルを「—」にします。
+
+# 変数対応表の読み込み
+
+```{r load-maps}
+var_map <- read_csv(file.path(params$map_dir, "khps_var_map.csv"),
+                    col_types = cols(.default = col_character(), col = col_integer()))
+file_meta <- read_csv(file.path(params$map_dir, "khps_file_meta.csv"),
+                      col_types = cols(file = col_character(), expected_ncol = col_integer()))
+id_reassign <- read_csv(file.path(params$map_dir, "id_reassign.csv"),
+                        col_types = cols(.default = col_double()))
+
+# 範囲チェック用：コードの最小・最大を取り出す（例 "1-3", "01-09(09=賃貸・不明)", "00-10"）
+rng <- str_match(var_map$code, "^(\\d+)-(\\d+)")
+var_map <- var_map %>%
+  mutate(code_min = suppressWarnings(as.numeric(rng[, 2])),
+         code_max = suppressWarnings(as.numeric(rng[, 3])),
+         na_num   = suppressWarnings(as.numeric(na)),
+         nap_num  = suppressWarnings(as.numeric(nap)))
+
+var_map %>% count(file, name = "変数の数") %>%
+  left_join(file_meta, by = "file") %>%
+  rename(ファイル = file, `codebook上の列数` = expected_ncol) %>%
+  kb(caption = "ファイル別の取り出す変数の数")
+```
+
+# CSV ファイルの検出
+
+ファイル名は README の命名規則（`KHPS20**#_data_ver*.csv`、`#` は continuous / newcohort）を前提に、`data_dir` 以下を再帰的に検索します。新婚票（`newlymar`）は読み込みません。
+
+```{r find-files}
+file_patterns <- tribble(
+  ~file,   ~survey_year, ~pattern,
+  # 「_」の有無は年によって違うため、どちらでも見つかるようにしている（例：KHPS2008data… と KHPS2007continuous_data…）
+  # 2004年調査（例：KHPS2004_wave01/KHPS2004data_ver11.0.csv）は学歴を取り出すためだけに使う
+  "2004",  2004, "^KHPS2004_?data.*\\.csv$",
+  "2007c", 2007, "^KHPS2007continuous_?data.*\\.csv$",
+  "2007n", 2007, "^KHPS2007newcohort_?data.*\\.csv$",
+  "2008",  2008, "^KHPS2008(continuous)?_?data.*\\.csv$",
+  "2009",  2009, "^KHPS2009(continuous)?_?data.*\\.csv$",
+  "2010",  2010, "^KHPS2010(continuous)?_?data.*\\.csv$",
+  "2011",  2011, "^KHPS2011(continuous)?_?data.*\\.csv$",
+  "2012c", 2012, "^KHPS2012continuous_?data.*\\.csv$",
+  "2013",  2013, "^KHPS2013(continuous|newcohort)?_?data.*\\.csv$",
+  "2014",  2014, "^KHPS2014(continuous|newcohort)?_?data.*\\.csv$",
+  "2015",  2015, "^KHPS2015(continuous|newcohort)?_?data.*\\.csv$",
+  "2016",  2016, "^KHPS2016(continuous|newcohort)?_?data.*\\.csv$",
+  "2017",  2017, "^KHPS2017(continuous|newcohort)?_?data.*\\.csv$",
+  "2018",  2018, "^KHPS2018(continuous|newcohort)?_?data.*\\.csv$"
+)
+
+if (!dir.exists(params$data_dir)) {
+  stop("data_dir が見つかりません: ", params$data_dir,
+       "\n Docker 内の RStudio からは /home/rstudio/works 以下しか見えません。",
+       "\n ホストの works フォルダの中にデータを置き、data_dir をコンテナ内のパスで指定してください。")
+}
+all_csv <- list.files(params$data_dir, pattern = "\\.csv$", recursive = TRUE,
+                      full.names = TRUE, ignore.case = TRUE)
+all_csv <- all_csv[!str_detect(basename(all_csv), "newlymar")]
+
+found <- file_patterns %>%
+  mutate(paths = map(pattern, ~ all_csv[str_detect(basename(all_csv), .x)]),
+         n_files = map_int(paths, length),
+         names = map_chr(paths, ~ paste(basename(.x), collapse = "; ")))
+
+# 自動検出がうまくいかない場合は、ここに手動でパスを書いてください（例）
+# found$paths[[which(found$file == "2011")]] <- "C:/.../KHPS2011_data_ver11.csv"
+# found$n_files[found$file == "2011"] <- 1
+
+found %>% select(ファイル = file, 調査年 = survey_year, 件数 = n_files, 見つかったファイル = names) %>%
+  kb(caption = "検出された CSV")
+
+# 2007〜2016年（主分析）は必須。2017・2018年（頑健性用）と2004年（学歴用）はなければ飛ばす。
+missing_main <- found$file[found$n_files == 0 & found$survey_year >= 2007 & found$survey_year <= 2016]
+missing_rob  <- found$file[found$n_files == 0 & (found$survey_year >= 2017 | found$survey_year == 2004)]
+if (length(missing_main) > 0) {
+  stop("主分析に必要なファイルが見つかりません: ", paste(missing_main, collapse = ", "),
+       "\n data_dir を確認するか、上のチャンクで手動指定してください。",
+       "\n data_dir 内で見つかった CSV（先頭40件）:\n ",
+       paste(head(basename(all_csv), 40), collapse = "\n "))
+}
+if (length(missing_rob) > 0) {
+  warning("頑健性用・学歴用のファイルがないため読み込みません: ", paste(missing_rob, collapse = ", "),
+          "（2004年がない場合、2004年コホートの学歴は欠測になります）")
+  found <- found %>% filter(n_files > 0)
+}
+```
+
+2013 年以降は、継続対象者と 2012 年新規コホートが同じ codebook（同じ列番号）を使っているため、該当するファイルが複数あればすべて読み込んで縦に結合します。
+
+# 読み込みと列数の確認
+
+```{r read-raw}
+read_raw <- function(path) {
+  x <- read_csv(path, col_names = FALSE,
+                col_types = cols(.default = col_character()),
+                locale = locale(encoding = params$csv_encoding),
+                na = c("", "NA"), trim_ws = TRUE, progress = FALSE)
+  names(x) <- paste0("X", seq_len(ncol(x)))
+  x
+}
+
+raw_list <- map(found$paths, function(p) map(p, read_raw))
+names(raw_list) <- found$file
+
+ncol_check <- imap_dfr(raw_list, function(lst, f) {
+  tibble(file = f,
+         csv = map_chr(found$paths[[which(found$file == f)]], basename),
+         n_rows = map_int(lst, nrow),
+         n_cols = map_int(lst, ncol))
+}) %>%
+  left_join(file_meta, by = "file") %>%
+  mutate(判定 = if_else(n_cols == expected_ncol, "OK", "列数が codebook と不一致"))
+
+ncol_check %>% kb(caption = "行数・列数（列数は codebook の変数数と一致するはず）")
+```
+
+列数が一致しない場合、列番号がずれている可能性があります。そのファイルは codebook の版（ver）とデータの版が同じか確認してください。
+
+# 変数の取り出し・欠損コード処理・範囲チェック
+
+各ファイルについて、対応表の列を取り出し、数値に変換し、**無回答コード（9, 99, 999…）と非該当コード（8, 88, 888…）を NA** にします。非該当と無回答の件数は別々に記録します。
+
+```{r extract}
+nap_keep <- c("debt_total", "mortgage_bal", "mortgage_repay", "ins_payout_amt")
+
+process_file <- function(f) {
+  vm  <- var_map %>% filter(file == f)
+  dat <- bind_rows(raw_list[[f]], .id = "src_i")
+  src_names <- basename(found$paths[[which(found$file == f)]])
+  miss_cols <- setdiff(paste0("X", vm$col), names(dat))
+  if (length(miss_cols) > 0) stop("ファイル ", f, " に存在しない列: ", paste(miss_cols, collapse = ", "))
+
+  out <- tibble(.rows = nrow(dat))
+  audit <- vector("list", nrow(vm))
+  for (i in seq_len(nrow(vm))) {
+    x_chr <- dat[[paste0("X", vm$col[i])]]
+    x     <- suppressWarnings(as.numeric(x_chr))
+    nonnum <- sum(!is.na(x_chr) & is.na(x))
+    is_na_code  <- !is.na(vm$na_num[i])  & !is.na(x) & x == vm$na_num[i]
+    is_nap_code <- !is.na(vm$nap_num[i]) & !is.na(x) & x == vm$nap_num[i]
+    x[is_na_code | is_nap_code] <- NA
+    # 範囲チェック（SA は codebook の範囲、MA は 0/1）
+    out_rng <- NA_real_
+    if (identical(vm$type[i], "SA") && !is.na(vm$code_min[i])) {
+      out_rng <- sum(!is.na(x) & (x < vm$code_min[i] | x > vm$code_max[i]))
+    } else if (identical(vm$type[i], "MA")) {
+      out_rng <- sum(!is.na(x) & !(x %in% c(0, 1)))
+    }
+    out[[vm$var[i]]] <- x
+    # 付問の金額は、借入やローンが「ない」世帯が非該当になる。後で 0 にするため非該当の印を残す
+    if (vm$var[i] %in% nap_keep) out[[paste0(vm$var[i], "_nap")]] <- is_nap_code
+    audit[[i]] <- tibble(file = f, var = vm$var[i], col = vm$col[i], type = vm$type[i],
+                         n = length(x), n_value = sum(!is.na(x)),
+                         n_noanswer = sum(is_na_code), n_nonapplicable = sum(is_nap_code),
+                         n_nonnumeric = nonnum, n_out_of_range = out_rng)
+  }
+  out <- out %>% mutate(file = f,
+                        survey_year = found$survey_year[found$file == f],
+                        src_csv = src_names[as.integer(dat$src_i)],   # どの CSV から来た行か（2013年は2ファイル）
+                        .before = 1)
+  list(data = out, audit = bind_rows(audit))
+}
+
+processed <- map(found$file, process_file)
+names(processed) <- found$file
+audit <- map_dfr(processed, "audit")
+write_csv(audit, file.path(params$out_dir, "audit_by_variable.csv"))
+```
+
+```{r audit-table}
+if (SHARE) {
+  cat("（共有用PDFでは、範囲チェックの結果は表示していません）\n")
+} else {
+flag <- audit %>%
+  filter((!is.na(n_out_of_range) & n_out_of_range / pmax(n_value, 1) > 0.01) | n_nonnumeric > 0) %>%
+  arrange(desc(n_out_of_range))
+if (nrow(flag) == 0) {
+  cat("範囲外の値（1%超）や数値でない値はありませんでした。\n")
+} else {
+  flag %>% select(ファイル = file, 変数 = var, 列 = col, 型 = type,
+                  有効値 = n_value, 範囲外 = n_out_of_range, 非数値 = n_nonnumeric) %>%
+    kb(caption = "要確認：範囲外の値が1%超、または数値でない値がある変数")
+}
+}
+```
+
+**読み方**：範囲外が多い変数は、列番号がずれているか、その年だけ選択肢が変わった可能性があります（例：住居の所有関係はコード 9 が「賃貸・不明」として追加されている年があります）。特に 2018 年は未照合の列番号なので、ここで異常がなければ列番号は概ね正しいと判断できます。全変数の件数は `audit_by_variable.csv` に保存しています。
+
+# 公式集計表（GT）との照合
+
+慶應義塾大学パネルデータ設計・解析センターが配布している各年の GT（グランドトータル、元データから作った公式の度数表）と、この前処理で作ったデータの集計を突き合わせます。**件数が一致すれば、列の取り違え・欠損コードの処理・ファイルの読み込みが正しい**ことの確認になります。期待値は `gt_expected.csv`（GT から抽出）に入っています。
+
+- 選択肢の変数（`code`）：各コードの件数が GT と一致するか
+- 金額の変数（`n_valid`）：有効回答数（GT の総数・該当者数 − 無回答）が一致するか
+- 金額の変数（`mean`）：平均（万円）が GT と一致するか（GT は小数第1位で丸めているため、差が 0.15 以内か 0.2% 以内なら一致とみなす）
+- 月支出合計の平均は、GT が一部の回答を「集計除外」にしているため参考扱い（`mean_ref`）
+
+2013年の GT は継続対象者分だけなので、2013年は継続対象者の CSV の行だけで集計します。2018年は GT がフォルダにないため照合していません。2004年は学歴（本人・配偶者）、2007年新規は学歴、2009年は傘を持つ降水確率を照合します（11/5追加）。共有用PDFでは、GT・前処理データのどちらかが `min_cell` 未満の件数（例：2004年の旧制学校の区分）は伏せます。
+
+```{r gt-check}
+gt_exp <- read_csv(file.path(params$map_dir, "gt_expected.csv"),
+                   col_types = cols(file = col_character(), var = col_character(), kind = col_character(),
+                                    code = col_double(), label = col_character(), expected = col_double(),
+                                    expected_low = col_double(), expected_mean = col_double(),
+                                    gt_table = col_character()))
+
+gt_obs <- function(f, v, kind, code) {
+  if (!f %in% names(processed)) return(NA_real_)
+  d <- processed[[f]]$data
+  if (f == "2013") d <- d %>% filter(str_detect(src_csv, "continuous"))
+  if (!v %in% names(d)) return(NA_real_)
+  x <- d[[v]]
+  switch(kind,
+         code     = sum(x == code, na.rm = TRUE),
+         n_valid  = sum(!is.na(x)),
+         n_valid_range = sum(!is.na(x)),
+         mean     = mean(x, na.rm = TRUE),
+         mean_ref = mean(x, na.rm = TRUE),
+         NA_real_)
+}
+
+gt_res <- gt_exp %>%
+  mutate(observed = pmap_dbl(list(file, var, kind, code), gt_obs),
+         target   = if_else(kind %in% c("mean", "mean_ref"), expected_mean, expected),
+         diff     = observed - target,
+         判定 = case_when(
+           is.na(observed) ~ "未照合",
+           kind == "mean_ref" ~ "参考",
+           kind == "mean" & abs(diff) <= pmax(0.15, 0.002 * abs(target)) ~ "○",
+           kind %in% c("code", "n_valid") & diff == 0 ~ "○",
+           kind == "n_valid_range" & observed >= expected_low & observed <= expected ~ "○",
+           kind == "code" & abs(diff) <= 2 ~ "△",
+           TRUE ~ "×"))
+write_csv(gt_res, file.path(params$out_dir, "gt_check.csv"))
+
+gt_res %>%
+  count(file, 判定) %>%
+  pivot_wider(names_from = 判定, values_from = n, values_fill = 0) %>%
+  rename(ファイル = file) %>%
+  kb(caption = "GT との照合結果（ファイル別の件数。○＝一致、△＝1〜2件の差、×＝不一致）")
+```
+
+```{r gt-fail}
+gt_fail <- gt_res %>% filter(判定 %in% c("×", "△")) %>% arrange(desc(判定 == "×"), file)
+if (nrow(gt_fail) == 0) {
+  cat("GT と一致しなかった項目はありませんでした。\n")
+} else {
+  out <- gt_fail %>%
+    transmute(ファイル = file, 変数 = var, 種類 = kind, コード = code, 選択肢 = label,
+              判定, GT = round(target, 1), 前処理データ = round(observed, 1), 差 = round(diff, 1))
+  if (SHARE) {
+    # 件数（code・n_valid）は、GT・前処理データのどちらかが min_cell 未満なら件数と差を伏せる
+    small <- gt_fail$kind %in% c("code", "n_valid", "n_valid_range") &
+      (gt_fail$target < MIN_CELL | gt_fail$observed < MIN_CELL)
+    out <- out %>% mutate(across(c(GT, 前処理データ, 差), as.character))
+    out$GT[small] <- "—"; out$前処理データ[small] <- "—"; out$差[small] <- "—"
+  }
+  kb(out, caption = "GT と一致しなかった項目（×を先に表示。全件は gt_check.csv）", digits = 1)
+}
+```
+
+**読み方**：
+- **×** は列番号のずれや、欠損コード・選択肢の扱いの違いが疑われます。×が出たら原因を調べてください。
+- **△**（選択肢の件数が1〜2件だけ違う）は、隣の選択肢と1件入れ替わっているだけで合計が同じであれば、GT を作った後にデータが修正された（版の違い）可能性があり、前処理の誤りとは限りません。
+- 月支出合計の有効回答数は、GT が「集計除外」とした回答をデータ上どう扱っているかが分からないため、「集計除外を引いた値」と「引かない値」の間に入っていれば ○ としています。
+- 2016年の借入金・住宅ローン残高の平均は、GT 側の値が異常（数十万〜数千万倍）なので参考扱いにしています。
+
+# 年をつなぐ（ID の処理）
+
+```{r bind}
+# 2004年調査は学歴を取り出すためだけに使うので、パネルの行には入れない
+panel <- map_dfr(processed[names(processed) != "2004"], "data") %>% select(-any_of("v2_rec_or_paneltype"))
+
+# 新 ID を旧 ID にそろえる関数（GEES・学歴の接続にも使う）
+to_hh <- function(id) {
+  m <- match(id, id_reassign$new_id)
+  if_else(is.na(m), id, id_reassign$old_id[m])
+}
+
+# 対象者の死亡等で配偶者が調査を引き継いだ世帯は新しい ID に変わっている（README の50件）。
+# 世帯固定効果用に、新 ID を旧 ID にそろえた hh_id を作る。
+panel <- panel %>%
+  left_join(id_reassign %>% select(new_id, old_id), by = c("id" = "new_id")) %>%
+  mutate(id_changed = !is.na(old_id),
+         hh_id = if_else(id_changed, old_id, id)) %>%
+  select(-old_id)
+
+# コホートの判定：2007年継続ファイルにいれば2004年コホート、2007年新規ファイルにいれば2007年コホート。
+# 2008〜2012年に初めて出てくる世帯は欠票からの「復活」、2013年以降に初めて出てくる世帯は2012年新規コホートとみなす。
+cohort_tbl <- panel %>%
+  group_by(hh_id) %>%
+  summarise(in_2007c = any(file == "2007c"), in_2007n = any(file == "2007n"),
+            first_year = min(survey_year), .groups = "drop") %>%
+  mutate(cohort = case_when(in_2007c ~ "2004",
+                            in_2007n ~ "2007",
+                            first_year <= 2012 ~ "復活(2004/2007)",
+                            TRUE ~ "2012新規(推定)")) %>%
+  select(hh_id, cohort)
+panel <- panel %>% left_join(cohort_tbl, by = "hh_id")
+
+dups <- panel %>% count(hh_id, survey_year) %>% filter(n > 1)
+```
+
+```{r id-report}
+if (SHARE) {
+  cat("（共有用PDFでは、ID の照合・付け替えの表は表示していません）\n\n")
+} else {
+  tibble(項目 = c("行数（世帯×年）", "世帯数（hh_id）", "ID付け替えの該当行", "同じ世帯・年の重複"),
+         値 = c(nrow(panel), n_distinct(panel$hh_id), sum(panel$id_changed), nrow(dups))) %>%
+    kb(caption = "ID の確認")
+}
+
+coh_tab <- panel %>% count(survey_year, cohort) %>%
+  pivot_wider(names_from = cohort, values_from = n, values_fill = 0)
+kb_n(coh_tab, setdiff(names(coh_tab), "survey_year"), caption = "調査年 × コホートの回答数")
+```
+
+```{r dup-stop}
+if (nrow(dups) > 0) warning("同じ hh_id・調査年の重複があります。確認してください。")
+if (SHARE) {
+  cat(if (nrow(dups) > 0) "同じ世帯・調査年の重複があります（一覧は自分用PDFで確認）。\n"
+      else "同じ世帯・調査年の重複はありません。\n")
+} else if (nrow(dups) > 0) {
+  kb(head(dups, 20), caption = "重複（先頭20件）。旧IDと新IDが同じ年に両方ある可能性")
+} else {
+  cat("同じ世帯・調査年の重複はありません。\n")
+}
+```
+
+# 学歴と危険回避度（世帯ごとの固定値）
+
+**学歴**：最終学歴は世帯がパネルに入った年だけの質問です。2004年コホートは2004年調査、2007年コホートは2007年新規調査から取ります。2004年は15区分（戦後6・戦前9）なので、2007年の選択肢の括弧書き（例：「高等学校（旧制中学・高等女学校）」）に合わせて6区分にそろえます。
+
+| 6区分 | 2004年のコード | 教育年数（卒業） |
+|---|---|---|
+| 1 中学校 | 1 新制中学、7 旧制尋常小学校、8 旧制高等小学校 | 9 |
+| 2 高等学校 | 2 新制高校、9 旧制中学校・高等女学校 | 12 |
+| 3 短大・高専 | 3 新制短大・高専、10 旧制実業学校、11 旧制師範学校、12 旧制高校・旧制専門学校・高等師範学校 | 14 |
+| 4 大学 | 4 新制大学、13 旧制大学 | 16 |
+| 5 大学院 | 5 新制大学院、14 旧制大学院 | 18 |
+| 6 その他 | 6 新制その他、15 旧制その他 | 欠測 |
+
+- 教育年数は「卒業した学校」で数えます。最後の学校を**中退・在学中**の人は、1つ下の段階の年数にします（中学6、高校9、短大・高専12、大学12、大学院16）。通学・卒業の質問が無回答の人は卒業とみなします。
+- `educ_years_max`：入った年の夫婦のうち長いほう（夫婦の役割の入れ替わりに左右されない世帯の指標）。結婚・再婚で後から加わった配偶者の学歴は新婚票にあり、読み込んでいません。
+- ID 付け替え世帯（配偶者が対象者を引き継いだ世帯）では、付け替え後の年は、入った年の配偶者の値を対象者の値として使い、配偶者の値は欠測にします。
+
+**危険回避度**：2009年調査の「降水確率が何%以上なら傘を持って出かけるか」（0〜100%）。**値が小さいほど危険回避的**です。2010・2011年の KHPS にはこの質問がなく、2012年以降は震災後なので使いません。100を超える値は欠測にします。
+
+```{r educ-risk}
+recode04 <- c(1, 2, 3, 4, 5, 6, 1, 1, 2, 3, 3, 3, 4, 5, 6)   # 2004年コード 1〜15 → 6区分
+yrs_grad <- c(9, 12, 14, 16, 18, NA)                          # 6区分 → 卒業の年数
+yrs_drop <- c(6,  9, 12, 12, 16, NA)                          # 中退・在学中 → 1つ下の段階
+
+educ_years_fn <- function(e6, status) {
+  case_when(is.na(e6) ~ NA_real_,
+            status %in% c(1, 3) ~ yrs_drop[e6],
+            TRUE ~ yrs_grad[e6])
+}
+
+pick_educ <- function(f, recode = NULL) {
+  if (!f %in% names(processed)) return(NULL)
+  d <- processed[[f]]$data
+  rc <- function(x) if (is.null(recode)) x else recode[x]
+  d %>% transmute(hh_id = to_hh(id), educ_src = f,
+                  e6_r = rc(educ_last_r), e6_s = rc(educ_last_s),
+                  st_r = educ_status_r, st_s = educ_status_s)
+}
+educ_tbl <- bind_rows(pick_educ("2004", recode04), pick_educ("2007n")) %>%
+  mutate(yr_r = educ_years_fn(e6_r, st_r), yr_s = educ_years_fn(e6_s, st_s)) %>%
+  distinct(hh_id, .keep_all = TRUE)
+
+risk_tbl <- panel %>% filter(survey_year == 2009) %>%
+  transmute(hh_id, chg09 = id_changed,
+            rk_r = if_else(risk_umbrella_r <= 100, risk_umbrella_r, NA_real_),
+            rk_s = if_else(risk_umbrella_s <= 100, risk_umbrella_s, NA_real_),
+            rk_over100 = (risk_umbrella_r > 100) %in% TRUE | (risk_umbrella_s > 100) %in% TRUE) %>%
+  distinct(hh_id, .keep_all = TRUE)
+
+panel <- panel %>%
+  select(-any_of(c("educ_last_r", "educ_last_s", "educ_status_r", "educ_status_s",
+                   "risk_umbrella_r", "risk_umbrella_s"))) %>%
+  left_join(educ_tbl, by = "hh_id") %>%
+  left_join(risk_tbl, by = "hh_id") %>%
+  mutate(
+    # 学歴：入った年は付け替え前なので、付け替え後の年は配偶者の値を対象者に
+    educ6_r      = if_else(id_changed, e6_s, e6_r),
+    educ6_s      = if_else(id_changed, NA_real_, e6_s),
+    educ_years_r = if_else(id_changed, yr_s, yr_r),
+    educ_years_s = if_else(id_changed, NA_real_, yr_s),
+    educ_years_max = suppressWarnings(pmax(yr_r, yr_s, na.rm = TRUE)),
+    educ_univ_r  = as.numeric(educ_years_r >= 16),
+    # 危険回避度：2009年と付け替えの状態が違う年は、対象者・配偶者を入れ替える
+    swap_rk      = !is.na(chg09) & (id_changed != chg09),
+    risk_umb09_r = if_else(swap_rk, rk_s, rk_r),
+    risk_umb09_s = if_else(swap_rk, rk_r, rk_s)
+  ) %>%
+  select(-e6_r, -e6_s, -st_r, -st_s, -yr_r, -yr_s, -chg09, -rk_r, -rk_s, -rk_over100, -swap_rk)
+```
+
+```{r educ-risk-report}
+hh11 <- panel %>% filter(survey_year == 2011, cohort %in% c("2004", "2007", "復活(2004/2007)"))
+
+cov_tab <- hh11 %>% group_by(コホート = cohort) %>%
+  summarise(`2011年の世帯` = n(),
+            `学歴あり（対象者）` = sum(!is.na(educ_years_r)),
+            `学歴あり（夫婦の長いほう）` = sum(!is.na(educ_years_max)),
+            `危険回避度あり（対象者）` = sum(!is.na(risk_umb09_r)),
+            .groups = "drop")
+kb_n(cov_tab, names(cov_tab)[-1], caption = "2011年調査の世帯のうち、学歴・危険回避度が付いた世帯数")
+
+e_tab <- hh11 %>%
+  mutate(学歴 = factor(educ6_r, 1:6, c("中学校", "高等学校", "短大・高専", "大学", "大学院", "その他"))) %>%
+  count(コホート = cohort, 学歴) %>%
+  mutate(学歴 = if_else(is.na(学歴), "欠測", as.character(学歴))) %>%
+  pivot_wider(names_from = 学歴, values_from = n, values_fill = 0)
+kb_n(e_tab, names(e_tab)[-1], caption = "対象者の最終学歴（6区分、2011年調査の世帯）")
+
+r_sum <- hh11 %>% filter(!is.na(risk_umb09_r)) %>%
+  summarise(世帯数 = n(), 平均 = mean(risk_umb09_r),
+            第1四分位 = quantile(risk_umb09_r, 0.25), 中央値 = median(risk_umb09_r),
+            第3四分位 = quantile(risk_umb09_r, 0.75))
+if (SHARE && r_sum$世帯数 < MIN_CELL) r_sum[, -1] <- NA
+kb(r_sum %>% mutate(世帯数 = sh_n(世帯数)),
+   caption = "危険回避度（2009年、傘を持つ降水確率%、対象者。2011年調査の世帯）", digits = 1)
+
+if (!SHARE) {
+  tibble(項目 = c("2009年に100を超える値があり欠測にした世帯"),
+         件数 = sum(risk_tbl$rk_over100)) %>%
+    kb(caption = "危険回避度の範囲チェック（自分用のみ）")
+}
+```
+
+**読み方**：2004年コホートで学歴が付いた世帯がほとんどなければ、2004年のファイルが読み込めていないか、ID が2004年と2007年以降で違う可能性があります。2009年に回答していない世帯（2010年以降の復活など）は危険回避度が欠測になります。
+
+# 派生変数の作成
+
+```{r derive}
+age_approx <- function(y, b) y - b - 1  # 1月31日時点。生まれ月を使わないため ±1 歳の誤差あり
+
+panel <- panel %>%
+  mutate(
+    rel_year  = survey_year - 2012,              # 2011年調査 = -1（基準年）、2012年調査 = 0
+    female    = if_else(sex == 2, 1, if_else(sex == 1, 0, NA_real_)),
+    age       = age_approx(survey_year, birth_year),
+    married_d = if_else(married == 1, 1, if_else(married == 2, 0, NA_real_)),
+    # 住居：1〜4 持ち家、5〜8 賃貸・社宅・その他、9（一部の年の「賃貸・不明」）は NA
+    owner     = case_when(tenure %in% 1:4 ~ 1, tenure %in% 5:8 ~ 0, TRUE ~ NA_real_),
+    moved_1yr = case_when(same_address_1yr == 2 ~ 1, same_address_1yr == 1 ~ 0, TRUE ~ NA_real_),
+    mortgage_d = case_when(mortgage == 1 ~ 1, mortgage == 2 ~ 0, TRUE ~ NA_real_),
+    ins_payout_d = case_when(ins_payout == 1 ~ 1, ins_payout == 2 ~ 0, TRUE ~ NA_real_),
+    # 金融資産（万円）
+    fin_assets = savings + securities,
+    # 就業：1〜4（仕事をした・休業）を就業とみなす
+    employed_r = case_when(emp_status_r %in% 1:4 ~ 1, emp_status_r %in% 5:6 ~ 0, TRUE ~ NA_real_),
+    employed_s = case_when(emp_status_s %in% 1:4 ~ 1, emp_status_s %in% 5:6 ~ 0, TRUE ~ NA_real_)
+  ) %>%
+  mutate(across(starts_with("debtpurp_") & !ends_with("_nap"), ~ case_when(.x == 1 ~ 1, .x == 2 ~ 0, TRUE ~ NA_real_)))
+
+# --- 「ない」世帯の金額を 0 にする ---
+# 借入金額・住宅ローン残高・保険金額は、借入・ローン・受け取りがある世帯だけに聞く付問。
+# 該当しない世帯は非該当コード（8888…）になっていたため、そのままだと欠損になり、
+# 平均や中央値が「借入がある世帯だけ」の値になってしまう。ここで 0 に置き換える。
+debtpurp_cols <- grep("^debtpurp_[a-z_]+$", names(panel), value = TRUE)
+debtpurp_cols <- debtpurp_cols[!grepl("_nap$", debtpurp_cols)]
+no_debt_purpose <- if (length(debtpurp_cols) > 0) {
+  rowSums(!is.na(panel[debtpurp_cols])) > 0 & rowSums(panel[debtpurp_cols] == 1, na.rm = TRUE) == 0
+} else rep(FALSE, nrow(panel))
+
+panel <- panel %>%
+  mutate(
+    debt_total = case_when(!is.na(debt_total) ~ debt_total,
+                           debt_total_nap %in% TRUE ~ 0,
+                           no_debt_purpose ~ 0,          # 借入目的がすべて「なし」（2009年以降）
+                           TRUE ~ NA_real_),
+    mortgage_bal = case_when(!is.na(mortgage_bal) ~ mortgage_bal,
+                             mortgage_d == 0 ~ 0,
+                             mortgage_bal_nap %in% TRUE ~ 0,
+                             TRUE ~ NA_real_),
+    mortgage_repay = case_when(!is.na(mortgage_repay) ~ mortgage_repay,
+                               mortgage_d == 0 ~ 0,
+                               mortgage_repay_nap %in% TRUE ~ 0,
+                               TRUE ~ NA_real_),
+    ins_payout_amt = case_when(!is.na(ins_payout_amt) ~ ins_payout_amt,
+                               ins_payout_d == 0 ~ 0,
+                               ins_payout_amt_nap %in% TRUE ~ 0,
+                               TRUE ~ NA_real_),
+    debt_any = case_when(debt_total > 0 ~ 1, debt_total == 0 ~ 0, TRUE ~ NA_real_)
+  ) %>%
+  select(-ends_with("_nap"))
+
+# --- 地震保険の調和 ---
+# 2007〜2011年：持家世帯への「地震保険に加入している(1)／していない(2)」。賃貸は非該当(NA)。
+# 2012年以降：住居・家財の別、1=加入済 2=加入意思あるが未加入 3=加入意思なく未加入。
+#   どちらかが1なら加入(1)、観察できた方がすべて2・3なら非加入(0)。
+panel <- panel %>%
+  mutate(
+    eq_post_any = (eq_bldg %in% 1) | (eq_cont %in% 1),
+    eq_post_obs = !is.na(eq_bldg) | !is.na(eq_cont),
+    eq_ins = case_when(
+      survey_year <= 2011 & eq_owner == 1 ~ 1,
+      survey_year <= 2011 & eq_owner == 2 ~ 0,
+      survey_year >= 2012 & eq_post_any   ~ 1,
+      survey_year >= 2012 & eq_post_obs   ~ 0,
+      TRUE ~ NA_real_),
+    eq_ins_bldg = case_when(eq_bldg == 1 ~ 1, eq_bldg %in% 2:3 ~ 0, TRUE ~ NA_real_),
+    eq_ins_cont = case_when(eq_cont == 1 ~ 1, eq_cont %in% 2:3 ~ 0, TRUE ~ NA_real_),
+    eq_intent   = case_when(eq_post_any ~ NA_real_,
+                            (eq_bldg %in% 2) | (eq_cont %in% 2) ~ 1,
+                            eq_post_obs ~ 0, TRUE ~ NA_real_),
+    fire_ins = case_when((fire_bldg %in% 1) | (fire_cont %in% 1) ~ 1,
+                         !is.na(fire_bldg) | !is.na(fire_cont) ~ 0, TRUE ~ NA_real_)
+  ) %>%
+  select(-eq_post_any, -eq_post_obs)
+
+# 2012年調査の加入年月から「震災前（2011年2月以前）からの加入」を判定（2012年1月時点で加入している世帯のみ）
+pre_join <- function(y, m) {
+  case_when(is.na(y) ~ NA_real_,
+            y <= 2010 ~ 1,
+            y == 2011 & !is.na(m) & m <= 2 ~ 1,
+            y == 2011 & !is.na(m) & m >= 3 ~ 0,
+            y >= 2012 ~ 0,
+            TRUE ~ NA_real_)
+}
+panel <- panel %>%
+  mutate(eq_pre_bldg_2012 = if_else(survey_year == 2012 & eq_bldg %in% 1, pre_join(eq_bldg_year, eq_bldg_month), NA_real_),
+         eq_pre_cont_2012 = if_else(survey_year == 2012 & eq_cont %in% 1, pre_join(eq_cont_year, eq_cont_month), NA_real_),
+         eq_pre_2012 = case_when(eq_pre_bldg_2012 %in% 1 | eq_pre_cont_2012 %in% 1 ~ 1,
+                                 !is.na(eq_pre_bldg_2012) | !is.na(eq_pre_cont_2012) ~ 0,
+                                 TRUE ~ NA_real_))
+
+# --- 「ご主人」「奥さま」表記の収入を「対象者」「配偶者」に読み替え ---
+# 有配偶：対象者が男性なら ご主人=対象者、女性なら 奥さま=対象者。無配偶：ご主人(対象者)=対象者（要確認）。
+comps <- sub("^inc_husband_", "", grep("^inc_husband_", names(panel), value = TRUE))
+for (cp in comps) {
+  h <- panel[[paste0("inc_husband_", cp)]]
+  w <- if (paste0("inc_wife_", cp) %in% names(panel)) panel[[paste0("inc_wife_", cp)]] else rep(NA_real_, nrow(panel))
+  panel[[paste0("inc_r_", cp)]] <- case_when(panel$married == 2 ~ h,
+                                             panel$sex == 1 ~ h, panel$sex == 2 ~ w,
+                                             TRUE ~ NA_real_)
+  panel[[paste0("inc_s_", cp)]] <- case_when(panel$married == 1 & panel$sex == 1 ~ w,
+                                             panel$married == 1 & panel$sex == 2 ~ h,
+                                             TRUE ~ NA_real_)
+}
+```
+
+```{r baseline}
+# 震災前（2011年調査）の値を全年に付ける（異質性分析・震災前統制用）
+base <- panel %>%
+  filter(survey_year == 2011) %>%
+  transmute(hh_id,
+            base_owner = owner, base_eq_ins = eq_ins, base_female = female, base_age = age,
+            base_married = married_d, base_hh_inc = hh_inc_gross, base_fin_assets = fin_assets,
+            base_debt = debt_total, base_mortgage = mortgage_d, base_employed_r = employed_r,
+            base_region = region, base_citysize = citysize, base_bldg_age = bldg_age)
+panel <- panel %>% left_join(base, by = "hh_id") %>%
+  mutate(in_2011 = hh_id %in% base$hh_id)
+```
+
+# パネルとしての整合性チェック
+
+同じ世帯の中で「年によって変わらないはずの値」が変わっていないかを数えます。列番号がずれていたり、ID のつなぎ方を間違えたりすると、ここで異常が多く出ます。対象者が死亡等で配偶者に交代した世帯（ID 付け替え）は、性別などが変わるのが当然なので除いています。
+
+```{r panel-consistency, eval = !SHARE}
+hh_changed <- panel %>% group_by(hh_id) %>% summarise(any_changed = any(id_changed), .groups = "drop")
+pc <- panel %>% left_join(hh_changed, by = "hh_id") %>% filter(!any_changed)
+
+per_hh <- pc %>% group_by(hh_id) %>%
+  summarise(n_years   = n(),
+            n_sex     = n_distinct(sex[!is.na(sex)]),
+            by_range  = if (all(is.na(birth_year))) NA_real_ else
+                          max(birth_year, na.rm = TRUE) - min(birth_year, na.rm = TRUE),
+            .groups = "drop") %>%
+  filter(n_years >= 2)
+
+lagged <- pc %>% arrange(hh_id, survey_year) %>% group_by(hh_id) %>%
+  mutate(prev_year = lag(survey_year), prev_region = lag(region),
+         prev_owner = lag(owner), prev_married = lag(married)) %>%
+  ungroup() %>%
+  filter(!is.na(prev_year), survey_year - prev_year == 1)
+
+region_change   <- lagged %>% filter(!is.na(region), !is.na(prev_region), region != prev_region)
+own_to_rent     <- lagged %>% filter(prev_owner %in% 1, owner %in% 0)
+
+tibble(
+  チェック = c("性別が年によって変わる世帯",
+               "生年が年によって変わる世帯（差が1年以上）",
+               "生年が2年以上ずれる世帯",
+               "地域ブロックが前年から変わった（世帯×年）",
+               "　うち「1年前と同じ住所」と答えている",
+               "持家→持家以外に変わった（世帯×年）",
+               "　うち「1年前と同じ住所」と答えている",
+               "配偶者の有無が前年から変わった（世帯×年）"),
+  該当 = c(sum(per_hh$n_sex > 1),
+           sum(per_hh$by_range >= 1, na.rm = TRUE),
+           sum(per_hh$by_range >= 2, na.rm = TRUE),
+           nrow(region_change),
+           sum(region_change$moved_1yr %in% 0),
+           nrow(own_to_rent),
+           sum(own_to_rent$moved_1yr %in% 0),
+           sum(lagged$married != lagged$prev_married, na.rm = TRUE)),
+  分母 = c(nrow(per_hh), nrow(per_hh), nrow(per_hh),
+           nrow(lagged), nrow(region_change), nrow(lagged), nrow(own_to_rent), nrow(lagged))
+) %>%
+  mutate(割合 = 該当 / pmax(分母, 1)) %>%
+  kb(caption = "パネルの整合性（2年以上回答した世帯。ID 付け替え世帯は除く）", digits = 4)
+```
+
+```{r panel-consistency-share, eval = SHARE, results = 'asis'}
+cat("（共有用PDFでは、パネル整合性の表は表示していません）\n")
+```
+
+**読み方**：
+- **性別・生年**が変わる世帯は、0件か、ごく少数（記入ミス）であるべきです。数%以上あれば、ID の接続か列番号に問題があります。生年の1年のずれは記入ミスでも起こりますが、2年以上のずれが多いのは異常です。
+- **地域ブロックが変わったのに「同じ住所」**と答えている世帯や、**同じ住所なのに持家でなくなった**世帯は、記入ミスか、どちらかの変数の列がずれている可能性があります。少数なら記入ミスとして扱えます。
+- **配偶者の有無の変化**は結婚・離別・死別で実際に起こるので、年に数%程度なら自然です。
+
+# GEES（震災特別調査）の接続
+
+```{r gees, eval = params$use_gees}
+gees_dir <- if (nzchar(params$gees_dir)) params$gees_dir else params$data_dir
+g_csv <- list.files(gees_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+g_path <- c(w1 = g_csv[str_detect(basename(g_csv), "^GEES_wave1_KHPS_?DATA.*\\.csv$")][1],
+            w2 = g_csv[str_detect(basename(g_csv), "^GEES_wave2_KHPS_?DATA.*\\.csv$")][1])
+if (any(is.na(g_path))) stop("GEES の CSV が見つかりません: ", paste(names(g_path)[is.na(g_path)], collapse = ", "))
+
+gees_map <- read_csv(file.path(params$map_dir, "gees_var_map.csv"),
+                     col_types = cols(.default = col_character(), wave = col_integer(), col = col_integer())) %>%
+  mutate(na_num = suppressWarnings(as.numeric(na)), nap_num = suppressWarnings(as.numeric(nap)))
+
+read_gees <- function(path, w) {
+  x <- read_csv(path, col_names = params$gees_has_header,
+                col_types = cols(.default = col_character()),
+                locale = locale(encoding = params$csv_encoding), trim_ws = TRUE, progress = FALSE)
+  names(x) <- paste0("X", seq_len(ncol(x)))
+  gm <- gees_map %>% filter(wave == w)
+  out <- tibble(id = suppressWarnings(as.numeric(x$X1)))
+  for (i in seq_len(nrow(gm))) {
+    v <- suppressWarnings(as.numeric(x[[paste0("X", gm$col[i])]]))
+    v[!is.na(gm$na_num[i])  & !is.na(v) & v == gm$na_num[i]]  <- NA
+    v[!is.na(gm$nap_num[i]) & !is.na(v) & v == gm$nap_num[i]] <- NA
+    out[[gm$var[i]]] <- v
+  }
+  out
+}
+g1 <- read_gees(g_path["w1"], 1) %>% mutate(gees_w1 = 1)
+g2 <- read_gees(g_path["w2"], 2) %>% mutate(gees_w2 = 1)
+
+ma01 <- function(x, answered) if_else(answered, as.numeric(coalesce(x, 0) == 1), NA_real_)
+
+g1 <- g1 %>% mutate(
+  damage_any      = case_when(damage %in% 1:3 ~ 1, damage == 4 ~ 0, TRUE ~ NA_real_),
+  damage_house    = case_when(damage %in% c(1, 3) ~ 1, damage %in% c(2, 4) ~ 0, TRUE ~ NA_real_),
+  damage_contents = case_when(damage %in% c(2, 3) ~ 1, damage %in% c(1, 4) ~ 0, TRUE ~ NA_real_),
+  damage_severe   = case_when(damage_house_degree %in% 1:3 ~ 1,   # 全壊・大規模半壊・半壊
+                              !is.na(damage_any) ~ 0, TRUE ~ NA_real_),
+  eq_pre_w1       = case_when(eq_w1 == 1 ~ 1, eq_w1 %in% 2:3 ~ 0, TRUE ~ NA_real_),
+  answered_victim = if_any(starts_with("victim_"), ~ !is.na(.x)),
+  across(starts_with("victim_"), ~ ma01(.x, answered_victim)),
+  victim_close    = as.numeric((victim_self + victim_spouse_child + victim_parents +
+                                victim_grandparents + victim_relatives) > 0)
+)
+
+g2 <- g2 %>% mutate(
+  eq_pre_w2   = case_when(eq_bldg_w2 %in% 1 | eq_cont_w2 %in% 1 ~ 1,
+                          !is.na(eq_bldg_w2) | !is.na(eq_cont_w2) ~ 0, TRUE ~ NA_real_),
+  eq_after_w2 = case_when(eq_pre_w2 == 1 ~ 0,
+                          eq_bldg_w2 %in% 2 | eq_cont_w2 %in% 2 ~ 1,
+                          !is.na(eq_pre_w2) ~ 0, TRUE ~ NA_real_),
+  dissat_any  = case_when(eq_dissat == 1 ~ 1, eq_dissat == 2 ~ 0, TRUE ~ NA_real_),
+  across(starts_with("dissat_") & !matches("dissat_any"),
+         ~ case_when(eq_dissat == 2 ~ 0, eq_dissat == 1 ~ as.numeric(coalesce(.x, 0) == 1), TRUE ~ NA_real_)),
+  # 「支払額が低い」に相当する不満：3・4・5 のいずれか
+  dissat_payout  = case_when(eq_dissat == 2 ~ 0,
+                             eq_dissat == 1 ~ as.numeric(dissat_partial_payout_low == 1 | dissat_cap_low == 1 |
+                                                           dissat_payout_lower_than_fire == 1),
+                             TRUE ~ NA_real_),
+  dissat_premium = dissat_premium_high
+)
+
+# GEES の ID を KHPS の hh_id にそろえる（to_hh は「年をつなぐ」の節で定義）
+g1 <- g1 %>% mutate(hh_id = to_hh(id)) %>% select(-id)
+g2 <- g2 %>% mutate(hh_id = to_hh(id)) %>% select(-id)
+if (anyDuplicated(g1$hh_id) || anyDuplicated(g2$hh_id)) warning("GEES に同じ ID が複数行あります。最初の行だけ使います。")
+g1 <- g1 %>% distinct(hh_id, .keep_all = TRUE)
+g2 <- g2 %>% distinct(hh_id, .keep_all = TRUE)
+
+ids_2011 <- unique(panel$hh_id[panel$survey_year == 2011])
+match_tbl <- tibble(
+  項目 = c("GEES第1回の回答数", "うち KHPS2011 の ID と一致", "GEES第2回の回答数", "うち KHPS2011 の ID と一致",
+           "GEES第1回 ID の桁数（最小〜最大）", "KHPS2011 ID の桁数（最小〜最大）"),
+  値 = c(nrow(g1), sum(g1$hh_id %in% ids_2011), nrow(g2), sum(g2$hh_id %in% ids_2011),
+        paste(range(nchar(format(g1$hh_id, scientific = FALSE, trim = TRUE)), na.rm = TRUE), collapse = "〜"),
+        paste(range(nchar(format(ids_2011, scientific = FALSE, trim = TRUE)), na.rm = TRUE), collapse = "〜")))
+if (SHARE) {
+  cat("（共有用PDFでは、GEES と KHPS の ID の照合の表は表示していません）\n\n")
+} else {
+  kb(match_tbl, caption = "GEES と KHPS2011 の接続（一致数が回答数とほぼ同じなら成功）")
+}
+
+if (sum(g1$hh_id %in% ids_2011) < 0.9 * nrow(g1)) {
+  warning("GEES第1回の ID の一致が9割未満です。ID の体系（桁数）が違う可能性があります。PDRC の説明を確認してください。")
+}
+
+panel <- panel %>%
+  left_join(g1, by = "hh_id") %>%
+  left_join(g2, by = "hh_id") %>%
+  mutate(gees_w1 = coalesce(gees_w1, 0), gees_w2 = coalesce(gees_w2, 0))
+```
+
+```{r no-gees, eval = !params$use_gees}
+panel <- panel %>% mutate(gees_w1 = NA_real_, gees_w2 = NA_real_, damage_any = NA_real_)
+```
+
+# 分析用サンプルの定義
+
+```{r samples}
+panel <- panel %>%
+  mutate(
+    cohort_ok   = cohort %in% c("2004", "2007", "復活(2004/2007)"),
+    main_window = survey_year %in% 2007:2016,
+    rob_window  = survey_year %in% 2007:2018,
+    # 主分析：2004・2007年コホート、2011年に持家、GEES第1回回答、2007〜2016年調査
+    main_sample = cohort_ok & base_owner %in% 1 & gees_w1 %in% 1 & main_window
+  )
+
+smp_tab <- panel %>% filter(cohort_ok, rob_window) %>%
+  group_by(survey_year) %>%
+  summarise(回答世帯 = n(),
+            `2011年に回答` = sum(hh_id %in% base$hh_id),
+            `2011年持家` = sum(base_owner %in% 1),
+            `+GEES第1回` = sum(base_owner %in% 1 & gees_w1 %in% 1),
+            `+被害あり` = sum(base_owner %in% 1 & gees_w1 %in% 1 & damage_any %in% 1),
+            .groups = "drop") %>%
+  rename(調査年 = survey_year)
+# 列は絞り込みの段階なので、行方向の補助的な秘匿はしない（各セルを min_cell で判定）
+kb(sh_mask_counts(as.data.frame(smp_tab), names(smp_tab)[-1], secondary = FALSE),
+   caption = "標本の絞り込み（各年の世帯数）")
+```
+
+# 記述統計（前処理の確認用）
+
+## 地震保険の加入率の推移
+
+```{r eq-trend}
+eq_tab <- panel %>%
+  filter(cohort_ok, rob_window, base_owner %in% 1) %>%
+  mutate(被害 = case_when(damage_any == 1 ~ "被害あり", damage_any == 0 ~ "被害なし", TRUE ~ "GEES未回答等")) %>%
+  group_by(survey_year, 被害) %>%
+  summarise(加入率 = mean(eq_ins, na.rm = TRUE), n = sum(!is.na(eq_ins)), .groups = "drop")
+
+eq_tab %>% mutate(値 = if_else(SHARE & n < MIN_CELL, "—", sprintf("%.3f (n=%d)", 加入率, n))) %>%
+  select(survey_year, 被害, 値) %>%
+  pivot_wider(names_from = 被害, values_from = 値) %>%
+  rename(調査年 = survey_year) %>%
+  kb(caption = "2011年持家世帯の地震保険加入率（2011年以前は持家のみの質問、2012年以降は住居または家財）")
+
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+  # 図の文字は英語にしています（PDF の図で日本語フォントが文字化けするのを避けるため）
+  plot_dat <- eq_tab %>% filter(被害 != "GEES未回答等", !(SHARE & n < MIN_CELL)) %>%
+    mutate(group = if_else(被害 == "被害あり", "Damaged (GEES)", "Not damaged"))
+  ggplot(plot_dat, aes(survey_year, 加入率, linetype = group)) +
+    geom_vline(xintercept = 2011.5, linewidth = 0.3) +
+    geom_line() + geom_point() +
+    scale_x_continuous(breaks = 2007:2018) +
+    labs(x = "Survey year (January)", y = "Earthquake insurance take-up", linetype = NULL) +
+    theme_minimal()
+}
+```
+
+縦線は震災（2011年3月）です。2011年と2012年の間で質問形式が変わる点に注意してください（変化の一部は形式の違いによる可能性があります）。
+
+## 震災前加入の測定の一致
+
+```{r eq-consistency, eval = params$use_gees}
+cons <- panel %>% filter(survey_year == 2011, cohort_ok, base_owner %in% 1, gees_w1 %in% 1)
+tab1 <- table(`KHPS2011（1月）` = cons$eq_ins, `GEES第1回 震災前加入` = cons$eq_pre_w1, useNA = "ifany")
+kb_xt(tab1, "KHPS2011＼GEES第1回", caption = "KHPS2011 と GEES第1回（6月、遡及）の一致（行：KHPS2011、列：GEES第1回、1=加入）")
+tab2 <- table(`KHPS2011（1月）` = cons$eq_ins, `GEES第2回 震災前加入` = cons$eq_pre_w2, useNA = "ifany")
+kb_xt(tab2, "KHPS2011＼GEES第2回", caption = "KHPS2011 と GEES第2回（10月、遡及）の一致（行：KHPS2011、列：GEES第2回、1=加入）")
+c12 <- panel %>% filter(survey_year == 2012, cohort_ok, base_owner %in% 1)
+tab3 <- table(`KHPS2011` = c12$base_eq_ins, `2012年の加入年月で震災前` = c12$eq_pre_2012, useNA = "ifany")
+kb_xt(tab3, "KHPS2011＼2012年加入年月", caption = "KHPS2011 と 2012年調査の加入年月（行：KHPS2011、列：2012年調査で震災前加入。2012年1月に加入中の世帯のみ判定可）")
+```
+
+## 震災前加入の食い違いの分析
+
+KHPS2011（2011年1月、震災前）と GEES第1回（2011年6月、震災後に「震災前に加入していたか」を遡及して質問）の回答が食い違う世帯を、向き・属性・地域別に調べます。対象は 2011年に持家で、両方の回答がある世帯です（KHPS2011 の地震保険は持家だけに質問しているため、賃貸世帯は含まれません）。
+
+```{r mismatch-prep, eval = params$use_gees}
+region_lab <- c("1" = "北海道", "2" = "東北", "3" = "関東", "4" = "中部",
+                "5" = "近畿", "6" = "中国", "7" = "四国", "8" = "九州")
+type_lv <- c("一致：加入", "一致：非加入", "KHPS加入→GEES非加入", "KHPS非加入→GEES加入")
+
+mm <- panel %>%
+  filter(survey_year == 2011, cohort_ok, base_owner %in% 1, gees_w1 %in% 1,
+         !is.na(eq_ins), !is.na(eq_pre_w1)) %>%
+  mutate(
+    type = factor(case_when(eq_ins == 1 & eq_pre_w1 == 1 ~ type_lv[1],
+                            eq_ins == 0 & eq_pre_w1 == 0 ~ type_lv[2],
+                            eq_ins == 1 & eq_pre_w1 == 0 ~ type_lv[3],
+                            eq_ins == 0 & eq_pre_w1 == 1 ~ type_lv[4]), levels = type_lv),
+    mismatch     = as.numeric(eq_ins != eq_pre_w1),
+    region_name  = unname(region_lab[as.character(region)]),
+    condo        = case_when(tenure == 2 ~ 1, tenure %in% c(1, 3, 4) ~ 0, TRUE ~ NA_real_),
+    fire_pre_w1  = case_when(fire_w1 == 1 ~ 1, fire_w1 %in% 2:3 ~ 0, TRUE ~ NA_real_),
+    log_inc      = log1p(hh_inc_gross),
+    log_fin      = log1p(fin_assets),
+    tohoku       = as.numeric(region == 2),
+    kanto        = as.numeric(region == 3),
+    citysize_big = as.numeric(citysize == 1)
+  )
+```
+
+### 食い違いの向き
+
+```{r mismatch-type, eval = params$use_gees}
+# 割合は件数から戻せるので、件数が伏せられる行は割合も伏せる
+mask_share_tab <- function(d) {
+  if (!SHARE) return(d)
+  small <- d$世帯数 < MIN_CELL
+  if (sum(small) == 1 && nrow(d) > 1) small[which.min(replace(d$世帯数, small, Inf))] <- TRUE
+  d %>% mutate(割合 = if_else(small, "—", formatC(割合, format = "f", digits = 3)),
+               世帯数 = if_else(small, "—", format(世帯数, big.mark = ",")))
+}
+mm %>% count(type, .drop = FALSE) %>%
+  mutate(割合 = n / sum(n)) %>%
+  rename(区分 = type, 世帯数 = n) %>%
+  mask_share_tab() %>%
+  kb(caption = paste0("KHPS2011 と GEES第1回の回答の組み合わせ（n=", nrow(mm), "）"))
+
+mm %>% filter(eq_ins == 1) %>%
+  mutate(GEESの回答 = recode(as.character(eq_w1), "1" = "震災前に加入済み",
+                             "2" = "加入を考えた", "3" = "加入を考えなかった")) %>%
+  count(GEESの回答) %>% mutate(割合 = n / sum(n)) %>% rename(世帯数 = n) %>%
+  mask_share_tab() %>%
+  kb(caption = "KHPS2011 で「加入」と答えた世帯の GEES第1回の回答")
+```
+
+KHPS2011 で加入と答えたのに GEES で「加入を考えた」と答えている世帯は、震災後に加入を検討・更新した経験を、震災前の加入と区別せずに答えた可能性があります。
+
+### 属性別
+
+```{r mismatch-attr, eval = params$use_gees}
+attr_by_type <- mm %>%
+  group_by(type, .drop = FALSE) %>%
+  summarise(
+    `世帯数`                   = n(),
+    `年齢（平均）`             = mean(age, na.rm = TRUE),
+    `女性の割合`               = sh_prop(female),
+    `有配偶の割合`             = sh_prop(married_d),
+    `世帯年収（中央値、万円）` = median(hh_inc_gross, na.rm = TRUE),
+    `金融資産（中央値、万円）` = median(fin_assets, na.rm = TRUE),
+    `住宅ローンありの割合`     = sh_prop(mortgage_d),
+    `マンションの割合`         = sh_prop(condo),
+    `築年数（中央値）`         = median(bldg_age, na.rm = TRUE),
+    `火災保険加入（GEES）`     = sh_prop(fire_pre_w1),
+    `被害ありの割合（GEES）`   = sh_prop(damage_any),
+    `政令市の割合`             = sh_prop(citysize_big),
+    .groups = "drop")
+# 共有用：世帯数が min_cell 未満の組み合わせは、その列の値をすべて伏せる
+small_type <- SHARE & attr_by_type$世帯数 < MIN_CELL
+attr_out <- attr_by_type %>%
+  mutate(across(-type, ~ if_else(small_type, NA_real_, as.numeric(.x)))) %>%
+  pivot_longer(-type, names_to = "属性", values_to = "値") %>%
+  mutate(値 = if_else(is.na(値), if (SHARE) "—" else "", formatC(値, format = "f", digits = 2))) %>%
+  pivot_wider(names_from = type, values_from = 値)
+kb(attr_out, caption = "回答の組み合わせ別の属性（2011年の値。世帯数以外は平均または中央値）")
+```
+
+### 地域別
+
+```{r mismatch-region, eval = params$use_gees}
+reg_sum <- function(d) {
+  d %>% summarise(世帯数 = n(),
+                  不一致率 = sh_prop(mismatch),
+                  `KHPS加入者のうちGEES非加入` = sh_prop(eq_pre_w1[eq_ins == 1] == 0),
+                  `KHPS非加入者のうちGEES加入` = sh_prop(eq_pre_w1[eq_ins == 0] == 1),
+                  .groups = "drop") %>%
+    # 片方だけ伏せると、不一致率との引き算で戻せるので、もう片方も伏せる
+    mutate(hide2 = SHARE & (is.na(`KHPS加入者のうちGEES非加入`) | is.na(`KHPS非加入者のうちGEES加入`)),
+           `KHPS加入者のうちGEES非加入` = if_else(hide2, NA_real_, `KHPS加入者のうちGEES非加入`),
+           `KHPS非加入者のうちGEES加入` = if_else(hide2, NA_real_, `KHPS非加入者のうちGEES加入`)) %>%
+    select(-hide2)
+}
+# 共有用では、小さくなる地域をまとめて 東北・関東・その他 の3区分にする
+reg_lv <- if (SHARE) c("東北", "関東", "その他") else unname(region_lab)
+reg_tab <- bind_rows(
+  mm %>% mutate(地域 = if (SHARE) case_when(region == 2 ~ "東北", region == 3 ~ "関東",
+                                            !is.na(region) ~ "その他")
+                       else region_name,
+                地域 = factor(地域, levels = reg_lv)) %>%
+    group_by(地域) %>% reg_sum() %>% mutate(地域 = as.character(地域)),
+  mm %>% reg_sum() %>% mutate(地域 = "全体")
+) %>% relocate(地域)
+if (SHARE) {
+  small_reg <- reg_tab$世帯数 < MIN_CELL
+  reg_tab <- reg_tab %>%
+    mutate(across(-c(地域, 世帯数), ~ if_else(small_reg | is.na(.x), "—", formatC(.x, format = "f", digits = 3))),
+           世帯数 = sh_n(世帯数))
+}
+kb(reg_tab, caption = "地域ブロック別の不一致率（世帯数が少ない地域は値が大きく振れるので注意）", digits = 3)
+```
+
+### 属性で食い違いを説明できるか（ロジット）
+
+KHPS2011 の回答ごとに分けて推定します。左は「KHPS2011 で加入 → GEES では非加入」になる確率、右は「KHPS2011 で非加入 → GEES では加入」になる確率です。
+
+```{r mismatch-logit, eval = params$use_gees}
+lab_var <- c("(Intercept)" = "切片", age = "年齢", female = "女性", married_d = "有配偶",
+             log_inc = "log(世帯年収)", log_fin = "log(金融資産)", mortgage_d = "住宅ローンあり",
+             condo = "マンション", damage_any = "被害あり（GEES）", tohoku = "東北",
+             kanto = "関東", citysize_big = "政令市")
+fml <- ~ age + female + married_d + log_inc + log_fin + mortgage_d + condo +
+  damage_any + tohoku + kanto + citysize_big
+
+tidy_glm <- function(m, nm) {
+  s <- summary(m)$coefficients
+  tibble(変数 = unname(lab_var[rownames(s)]),
+         !!paste0(nm, "：係数") := s[, 1],
+         !!paste0(nm, "：p値")  := fmt_p(s[, 4]))
+}
+m_a <- glm(update(fml, I(eq_pre_w1 == 0) ~ .), data = filter(mm, eq_ins == 1), family = binomial())
+m_b <- glm(update(fml, I(eq_pre_w1 == 1) ~ .), data = filter(mm, eq_ins == 0), family = binomial())
+
+full_join(tidy_glm(m_a, "加入→非加入"), tidy_glm(m_b, "非加入→加入"), by = "変数") %>%
+  kb(caption = paste0("食い違いのロジット（左 n=", nobs(m_a), "、右 n=", nobs(m_b), "）"), digits = 3)
+```
+
+食い違いの件数は少ないため、係数は不安定になりえます。ここでの p値は、どの属性に偏りがありそうかを探るための目安として読んでください。
+
+### 比較：震災前の KHPS 同士でも答えは変わるか
+
+同じ KHPS の同じ質問でも、震災前の年どうしで回答がどれだけ変わるかを見ておくと、「GEES との食い違い」が通常の回答のぶれの範囲かどうかを判断する目安になります。
+
+```{r mismatch-baseline}
+trans_tab <- function(y0, y1) {
+  panel %>%
+    filter(cohort_ok, survey_year %in% c(y0, y1), owner %in% 1, !is.na(eq_ins)) %>%
+    select(hh_id, survey_year, eq_ins) %>%
+    pivot_wider(names_from = survey_year, values_from = eq_ins, names_prefix = "y") %>%
+    filter(!is.na(.data[[paste0("y", y0)]]), !is.na(.data[[paste0("y", y1)]]))
+}
+t0910 <- trans_tab(2009, 2010)
+t1011 <- trans_tab(2010, 2011)
+
+kb_xt(table(t1011$y2010, t1011$y2011), "2010＼2011",
+      caption = "KHPS2010 と KHPS2011 の地震保険加入（両年とも持家の世帯、1=加入）")
+
+chg <- tibble(
+  比較 = c("KHPS2009 → KHPS2010", "KHPS2010 → KHPS2011"),
+  世帯数 = c(nrow(t0910), nrow(t1011)),
+  `回答が変わった割合` = c(mean(t0910$y2009 != t0910$y2010), mean(t1011$y2010 != t1011$y2011)),
+  `加入→非加入` = c(mean(t0910$y2009 == 1 & t0910$y2010 == 0), mean(t1011$y2010 == 1 & t1011$y2011 == 0)),
+  `非加入→加入` = c(mean(t0910$y2009 == 0 & t0910$y2010 == 1), mean(t1011$y2010 == 0 & t1011$y2011 == 1)))
+if (params$use_gees && exists("mm")) {
+  chg <- bind_rows(chg, tibble(
+    比較 = "KHPS2011 → GEES第1回（遡及）", 世帯数 = nrow(mm),
+    `回答が変わった割合` = mean(mm$mismatch),
+    `加入→非加入` = mean(mm$type == type_lv[3]),
+    `非加入→加入` = mean(mm$type == type_lv[4])))
+}
+kb(chg, caption = "回答が変わる割合の比較（KHPS 同士は実際の加入・解約も含む）", digits = 3)
+```
+
+KHPS 同士の変化には、本当に加入・解約した世帯も含まれます。GEES との食い違いがこれと同じくらいなら、通常の回答のぶれと実際の加入変更で説明できる範囲と考えられます。大きく上回るなら、GEES の遡及質問の測り方（質問の仕方、震災後の記憶、回答者の違い）に原因がある可能性が高くなります。
+
+## 主な変数の分布（単位の確認）
+
+```{r units}
+panel %>% filter(cohort_ok, rob_window) %>%
+  group_by(survey_year) %>%
+  summarise(across(c(savings, securities, debt_total, hh_inc_gross, exp_total, mortgage_bal),
+                   ~ median(.x, na.rm = TRUE)), .groups = "drop") %>%
+  rename(調査年 = survey_year, 預貯金 = savings, 有価証券 = securities, 借入金 = debt_total,
+         世帯年収 = hh_inc_gross, 月支出合計 = exp_total, 住宅ローン残高 = mortgage_bal) %>%
+  kb(caption = "中央値。預貯金・有価証券・借入金・年収・住宅ローンは万円、月支出は千円。借入金・住宅ローン残高は、借入・ローンのない世帯を0として含む", digits = 0)
+```
+
+世帯年収は**前年1〜12月**の値です（2012年調査の値は2011年＝震災前後の混在）。預貯金・借入金は調査時点（1月）の残高、支出は1月の1か月分です。実質化する場合は、別途 CPI の表を用意して年ごとに割ってください（このコードでは行っていません）。
+
+## 標本脱落（2011年回答世帯のその後）
+
+```{r attrition}
+coh11 <- panel %>% filter(survey_year == 2011, cohort_ok) %>% select(hh_id, damage_any, gees_w1)
+pres <- panel %>% filter(cohort_ok, survey_year >= 2011, survey_year <= 2018) %>% distinct(hh_id, survey_year)
+attr_tab <- coh11 %>%
+  mutate(group = case_when(gees_w1 %in% 0 ~ "GEES未回答",
+                           damage_any %in% 1 ~ "被害あり", damage_any %in% 0 ~ "被害なし",
+                           TRUE ~ "GEES回答・被害不明")) %>%
+  crossing(survey_year = as.numeric(2011:2018)) %>%
+  left_join(pres %>% mutate(present = 1), by = c("hh_id", "survey_year")) %>%
+  group_by(group, survey_year) %>%
+  summarise(継続回答率 = mean(coalesce(present, 0)), n = n(), .groups = "drop")
+attr_tab %>% mutate(v = if_else(SHARE & n < MIN_CELL, "—", sprintf("%.2f", 継続回答率))) %>%
+  select(group, survey_year, v) %>%
+  pivot_wider(names_from = survey_year, values_from = v) %>%
+  rename(グループ = group) %>%
+  kb(caption = "2011年回答世帯がその後の調査に回答している割合")
+```
+
+```{r gees-response, eval = params$use_gees}
+resp <- panel %>% filter(survey_year == 2011, cohort_ok) %>%
+  mutate(log_inc = log1p(base_hh_inc), log_fin = log1p(base_fin_assets),
+         tohoku = as.numeric(base_region == 2), kanto = as.numeric(base_region == 3))
+m <- glm(gees_w1 ~ base_owner + base_eq_ins + log_inc + log_fin + base_age + base_female +
+           base_married + tohoku + kanto, data = resp, family = binomial())
+coef_tab <- as.data.frame(summary(m)$coefficients)
+# 「(Intercept)」のように「(」で始まるセルは、日本語文書クラスの LaTeX で表の行頭に来るとエラーになるため置き換える
+coef_tab$変数 <- sub("^\\(Intercept\\)$", "切片", rownames(coef_tab))
+rownames(coef_tab) <- NULL
+coef_tab %>% mutate(p値 = fmt_p(`Pr(>|z|)`)) %>%
+  select(変数, 係数 = Estimate, 標準誤差 = `Std. Error`, p値) %>%
+  kb(caption = paste0("GEES第1回への回答の決定要因（ロジット、2011年回答世帯、n=", nobs(m), "）"))
+```
+
+ロジットの説明変数のうち `base_eq_ins` は持家世帯にしか値がないため、この推定は実質的に持家世帯に限られます。
+
+# 保存
+
+```{r save}
+keep_first <- c("hh_id", "id", "id_changed", "cohort", "survey_year", "rel_year", "file",
+                "main_sample", "main_window", "rob_window", "cohort_ok")
+panel_out <- panel %>% relocate(any_of(keep_first)) %>% arrange(hh_id, survey_year)
+
+saveRDS(panel_out, file.path(params$out_dir, "khps_panel_2007_2018.rds"))
+write_csv(panel_out, file.path(params$out_dir, "khps_panel_2007_2018.csv"), na = "")
+saveRDS(panel_out %>% filter(main_sample), file.path(params$out_dir, "khps_main_2007_2016.rds"))
+
+tibble(ファイル = c("khps_panel_2007_2018.rds / .csv", "khps_main_2007_2016.rds", "audit_by_variable.csv"),
+       内容 = c("全世帯×年（2007〜2018年、全変数）", "主分析サンプルのみ", "変数×ファイル別の欠損・範囲チェック"),
+       行数 = c(nrow(panel_out), sum(panel_out$main_sample), nrow(audit))) %>%
+  kb(caption = paste0("保存先：", normalizePath(params$out_dir)))
+```
+
+# 主な作成変数
+
+| 変数 | 内容 |
+|---|---|
+| `hh_id` | 世帯ID（ID付け替え50件を旧IDにそろえたもの） |
+| `rel_year` | 震災からの相対年（2011年調査 = −1） |
+| `eq_ins` | 地震保険加入（2011年以前は持家のみ、2012年以降は住居または家財） |
+| `eq_ins_bldg`, `eq_ins_cont` | 2012年以降の住居・家財別の加入 |
+| `eq_intent` | 未加入だが加入意思あり（2012年以降） |
+| `eq_pre_2012` | 2012年の加入年月から見た震災前加入（2012年1月時点の加入者のみ） |
+| `owner`, `moved_1yr` | 持家、1年前と別の住所 |
+| `debt_any` | 借入金あり（借入金額が0より大きい） |
+| `fin_assets`, `debt_total`, `hh_inc_gross`, `exp_total` | 金融資産・借入金（ない世帯は0）・世帯年収（万円）、月支出合計（千円） |
+| `inc_r_*`, `inc_s_*` | 対象者・配偶者の収入（「ご主人」「奥さま」から読み替え） |
+| `employed_r`, `employed_s` | 対象者・配偶者の就業 |
+| `base_*` | 2011年調査（震災前）の値 |
+| `damage_any`, `damage_house`, `damage_contents`, `damage_severe` | GEES第1回の被害 |
+| `eq_pre_w1`, `eq_pre_w2`, `eq_after_w2` | GEES での震災前・震災後の加入 |
+| `dissat_any`, `dissat_payout`, `dissat_premium` | 地震保険制度への不満（支払額系＝選択肢3〜5のいずれか） |
+| `main_sample` | 主分析サンプル |
+| `educ6_r`, `educ6_s` | 最終学歴の6区分（1 中学校〜5 大学院、6 その他）。パネルに入った年の値（2004年調査または2007年新規調査） |
+| `educ_years_r`, `educ_years_s`, `educ_univ_r` | 教育年数（中退・在学中は1つ下の段階）、対象者が大学卒以上 |
+| `educ_years_max` | 入った年の夫婦のうち長いほうの教育年数 |
+| `educ_src` | 学歴の出所（"2004" または "2007n"） |
+| `risk_umb09_r`, `risk_umb09_s` | 危険回避度：2009年の「傘を持って出かける降水確率（%）」。小さいほど危険回避的 |
+| `base_bldg_age` | 2011年調査の築年数 |
+
+```{r session, echo=FALSE}
+cat("R:", R.version.string, "\n")
+```
